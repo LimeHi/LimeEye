@@ -2,6 +2,9 @@ import asyncio
 import logging
 import time
 
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 from utils import parse_duration, human_duration, chat_info, sender_info, html_escape
 from tictactoe import new_board, render_text, render_keyboard
 
@@ -137,15 +140,41 @@ async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str 
             return "Игра в этом чате не запущена."
         await storage.delete_game(bc_id, chat_id)
         if existing.get("message_id"):
+            # Сначала пробуем удалить само игровое сообщение целиком — так в
+            # чате не остаётся "зависшего" заголовка/статуса хода. Если прав
+            # на удаление нет, тогда хотя бы обновляем текст на "игра
+            # остановлена" и убираем кнопки.
+            deleted = False
             try:
-                await bot.edit_message_reply_markup(
+                await bot.delete_business_messages(
                     business_connection_id=bc_id,
-                    chat_id=chat_id,
-                    message_id=existing["message_id"],
-                    reply_markup=None,
+                    message_ids=[existing["message_id"]],
                 )
-            except Exception:
-                pass
+                deleted = True
+            except TelegramAPIError:
+                log.info(
+                    "Не удалось удалить игровое сообщение %s в чате %s (нет прав?), "
+                    "обновляю текст вместо удаления", existing["message_id"], chat_id,
+                )
+            if not deleted:
+                try:
+                    stopped_text = (
+                        "❌⭕ <b>Крестики-нолики</b>\n"
+                        f"❌ {html_escape(existing['x_name'])}  vs  ⭕ {html_escape(existing['o_name'])}\n\n"
+                        "⏹ Игра остановлена."
+                    )
+                    await bot.edit_message_text(
+                        business_connection_id=bc_id,
+                        chat_id=chat_id,
+                        message_id=existing["message_id"],
+                        text=stopped_text,
+                        reply_markup=None,
+                    )
+                except TelegramAPIError:
+                    log.exception(
+                        "Не удалось обновить игровое сообщение %s в чате %s после stop",
+                        existing["message_id"], chat_id,
+                    )
         return None
 
     x_name = sender_info(message)["name"]
@@ -197,3 +226,196 @@ COMMANDS = {
     "ping": cmd_ping,
     "help": cmd_help,
 }
+
+
+# ---------------------------------------------------------------------------
+# Интерактивная справка для /start: кнопочное меню с описанием каждой
+# команды, а у команд с подкомандами (например .tic stop) — ещё один уровень
+# кнопок с подробностями по каждой подкоманде.
+# ---------------------------------------------------------------------------
+
+HELP_ITEMS = [
+    {
+        "key": "mute",
+        "button": "🔇 .mute",
+        "title": "🔇 .mute [время]",
+        "desc": (
+            "Глушит входящие сообщения в текущем чате: всё, что пишет собеседник, "
+            "бот сразу удаляет. Удобно, чтобы не получать уведомления от чата, "
+            "не выходя из него и не блокируя человека.\n\n"
+            "⚠️ Чтобы бот мог удалять сообщения, в настройках Business-подключения "
+            "должно быть выдано право «Удаление сообщений»."
+        ),
+        "subs": [
+            {
+                "key": "forever",
+                "button": "Без времени — навсегда",
+                "title": ".mute — навсегда",
+                "desc": "<code>.mute</code> — замьютить чат навсегда, до команды <code>.unmute</code>.",
+            },
+            {
+                "key": "timed",
+                "button": "С длительностью",
+                "title": ".mute [время]",
+                "desc": (
+                    "<code>.mute 1h30m</code>, <code>.mute 2d</code> — замьютить на указанное "
+                    "время. Поддерживаются единицы: <code>d</code> (дни), <code>h</code> (часы), "
+                    "<code>m</code> (минуты), <code>s</code> (секунды) — их можно сочетать. "
+                    "По истечении срока мьют снимется автоматически."
+                ),
+            },
+        ],
+    },
+    {
+        "key": "unmute",
+        "button": "🔊 .unmute",
+        "title": "🔊 .unmute",
+        "desc": "Снимает мьют с текущего чата — входящие сообщения снова доходят как обычно.",
+        "subs": [],
+    },
+    {
+        "key": "muted",
+        "button": "📋 .muted",
+        "title": "📋 .muted",
+        "desc": (
+            "Показывает список всех замьюченных чатов: с юзернеймом/именем и оставшимся "
+            "временем (или пометкой «навсегда»)."
+        ),
+        "subs": [],
+    },
+    {
+        "key": "clean",
+        "button": "🧹 .clean",
+        "title": "🧹 .clean",
+        "desc": (
+            "Очищает локальный кэш сообщений этого чата. Кэш используется для save/edit-"
+            "отчётов (чтобы показать текст удалённого или изменённого сообщения) — "
+            "<code>.clean</code> стирает эту историю, если она больше не нужна."
+        ),
+        "subs": [],
+    },
+    {
+        "key": "anim",
+        "button": "⌨️ .anim",
+        "title": "⌨️ .anim текст",
+        "desc": (
+            "Отправляет сообщение с эффектом «печатает»: бот показывает статус typing "
+            "и постепенно дописывает слова прямо в уже отправленном сообщении."
+        ),
+        "subs": [
+            {
+                "key": "usage",
+                "button": "Пример использования",
+                "title": ".anim текст",
+                "desc": "<code>.anim привет, как дела?</code>",
+            },
+        ],
+    },
+    {
+        "key": "tic",
+        "button": "❌⭕ .tic",
+        "title": "❌⭕ .tic",
+        "desc": (
+            "Начинает игру в крестики-нолики с собеседником прямо в чате: под сообщением "
+            "появляется игровое поле с кнопками. Владелец аккаунта играет ❌, собеседник — ⭕, "
+            "ходите по очереди, нажимая на клетки. После завершения игры под полем появится "
+            "кнопка «🔄 Играть снова»."
+        ),
+        "subs": [
+            {
+                "key": "stop",
+                "button": ".tic stop — остановить игру",
+                "title": ".tic stop",
+                "desc": (
+                    "Досрочно завершает текущую игру в этом чате: убирает игровое сообщение "
+                    "из чата (или, если прав на удаление нет, помечает его как остановленное) "
+                    "и сбрасывает состояние — после этого можно начать заново командой "
+                    "<code>.tic</code>.\n\nСинонимы: <code>.tic cancel</code>, <code>.tic стоп</code>."
+                ),
+            },
+        ],
+    },
+    {
+        "key": "ping",
+        "button": "🏓 .ping",
+        "title": "🏓 .ping",
+        "desc": "Проверка, что бот жив и отвечает — присылает «pong» в личку владельцу.",
+        "subs": [],
+    },
+    {
+        "key": "help",
+        "button": "❓ .help",
+        "title": "❓ .help",
+        "desc": "Присылает список всех команд одним сообщением прямо в чат с собеседником.",
+        "subs": [],
+    },
+]
+
+HELP_BY_KEY = {item["key"]: item for item in HELP_ITEMS}
+
+
+def _find_sub(cmd_key: str, sub_key: str) -> dict | None:
+    item = HELP_BY_KEY.get(cmd_key)
+    if not item:
+        return None
+    for sub in item["subs"]:
+        if sub["key"] == sub_key:
+            return sub
+    return None
+
+
+def build_help_root_text() -> str:
+    return (
+        "<b>LimeEye — команды</b>\n\n"
+        "Ниже список всех команд бота. Нажми на любую, чтобы посмотреть подробное "
+        "описание (а если у команды есть варианты использования — они тоже будут "
+        "отдельными кнопками).\n\n"
+        "Все команды пишутся прямо в чате с собеседником (не сюда, боту), с префиксом «.»."
+    )
+
+
+def build_help_root_kb() -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for item in HELP_ITEMS:
+        row.append(InlineKeyboardButton(text=item["button"], callback_data=f"help:cmd:{item['key']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_help_cmd_text(cmd_key: str) -> str | None:
+    item = HELP_BY_KEY.get(cmd_key)
+    if not item:
+        return None
+    return f"<b>{item['title']}</b>\n\n{item['desc']}"
+
+
+def build_help_cmd_kb(cmd_key: str) -> InlineKeyboardMarkup | None:
+    item = HELP_BY_KEY.get(cmd_key)
+    if not item:
+        return None
+    rows = []
+    for sub in item["subs"]:
+        rows.append([InlineKeyboardButton(
+            text=sub["button"], callback_data=f"help:sub:{cmd_key}:{sub['key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Ко всем командам", callback_data="help:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_help_sub_text(cmd_key: str, sub_key: str) -> str | None:
+    sub = _find_sub(cmd_key, sub_key)
+    if not sub:
+        return None
+    return f"<b>{sub['title']}</b>\n\n{sub['desc']}"
+
+
+def build_help_sub_kb(cmd_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"help:cmd:{cmd_key}")],
+        [InlineKeyboardButton(text="◀️ Ко всем командам", callback_data="help:root")],
+    ])

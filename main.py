@@ -9,7 +9,12 @@ from aiogram.types import BotCommand
 
 from config import BOT_TOKEN, CMD_PREFIX
 from storage import Storage
-from commands import COMMANDS, cmd_muted, HELP_TEXT
+from commands import (
+    COMMANDS, cmd_muted, HELP_TEXT,
+    build_help_root_text, build_help_root_kb,
+    build_help_cmd_text, build_help_cmd_kb,
+    build_help_sub_text, build_help_sub_kb,
+)
 from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html
 from tictactoe import EMPTY, new_board, apply_move, check_result, other_mark, render_text, render_keyboard
 
@@ -76,6 +81,7 @@ async def on_direct_message(message: types.Message):
             "выбери меня и включи право «Удаление сообщений», если хочешь пользоваться .mute.\n\n"
             "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же."
         )
+        await message.answer(build_help_root_text(), reply_markup=build_help_root_kb())
         return
 
     if message.text.startswith("/help"):
@@ -266,6 +272,44 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         )
         await notify_owner(conn["owner_chat_id"], report)
         await send_recovered_media(conn["owner_chat_id"], cached.get("media_kind"), cached.get("media_file_id"))
+
+
+# ---------------------------------------------------------------------------
+# Интерактивное меню-справка по командам (кнопки под /start)
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data.startswith("help:"))
+async def on_help_callback(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    message = callback.message
+    if message is None:
+        await callback.answer()
+        return
+
+    try:
+        if parts[1] == "root":
+            await message.edit_text(build_help_root_text(), reply_markup=build_help_root_kb())
+
+        elif parts[1] == "cmd" and len(parts) == 3:
+            cmd_key = parts[2]
+            text = build_help_cmd_text(cmd_key)
+            kb = build_help_cmd_kb(cmd_key)
+            if text is None or kb is None:
+                await callback.answer("Команда не найдена.", show_alert=True)
+                return
+            await message.edit_text(text, reply_markup=kb)
+
+        elif parts[1] == "sub" and len(parts) == 4:
+            cmd_key, sub_key = parts[2], parts[3]
+            text = build_help_sub_text(cmd_key, sub_key)
+            if text is None:
+                await callback.answer("Не найдено.", show_alert=True)
+                return
+            await message.edit_text(text, reply_markup=build_help_sub_kb(cmd_key))
+
+    except TelegramAPIError:
+        log.exception("Не удалось обновить меню-справку (data=%s)", callback.data)
+
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
