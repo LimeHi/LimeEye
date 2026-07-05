@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS messages_cache (
     chat_username TEXT,
     text TEXT,
     media_type TEXT,
+    media_kind TEXT,      -- photo/video/voice/video_note/document/animation/audio — для повторной отправки
+    media_file_id TEXT,   -- file_id, чтобы переслать файл заново (send_photo/send_video/...)
     date INTEGER,
     PRIMARY KEY (business_connection_id, chat_id, msg_id)
 );
@@ -47,6 +49,8 @@ CREATE TABLE IF NOT EXISTS muted_chats (
 MIGRATIONS = [
     ("muted_chats", "chat_name", "TEXT"),
     ("muted_chats", "chat_username", "TEXT"),
+    ("messages_cache", "media_kind", "TEXT"),
+    ("messages_cache", "media_file_id", "TEXT"),
 ]
 
 
@@ -123,12 +127,12 @@ class Storage:
 
     async def cache_message(self, business_connection_id, chat_id, msg_id, sender_id,
                              sender_name, sender_username, chat_name, chat_username,
-                             text, media_type):
+                             text, media_type, media_kind=None, media_file_id=None):
         await self._db.execute(
             """INSERT INTO messages_cache
                (business_connection_id, chat_id, msg_id, sender_id, sender_name, sender_username,
-                chat_name, chat_username, text, media_type, date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chat_name, chat_username, text, media_type, media_kind, media_file_id, date)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(business_connection_id, chat_id, msg_id) DO UPDATE SET
                  sender_id=excluded.sender_id,
                  sender_name=excluded.sender_name,
@@ -137,10 +141,12 @@ class Storage:
                  chat_username=excluded.chat_username,
                  text=excluded.text,
                  media_type=excluded.media_type,
+                 media_kind=excluded.media_kind,
+                 media_file_id=excluded.media_file_id,
                  date=excluded.date
             """,
             (business_connection_id, chat_id, msg_id, sender_id, sender_name, sender_username,
-             chat_name, chat_username, text, media_type, int(time.time())),
+             chat_name, chat_username, text, media_type, media_kind, media_file_id, int(time.time())),
         )
         await self._db.commit()
         await self._trim(business_connection_id, chat_id)
@@ -161,7 +167,8 @@ class Storage:
     async def get_cached(self, business_connection_id, chat_id, msg_id):
         cur = await self._db.execute(
             "SELECT business_connection_id, chat_id, msg_id, sender_id, sender_name, "
-            "sender_username, chat_name, chat_username, text, media_type, date "
+            "sender_username, chat_name, chat_username, text, media_type, media_kind, "
+            "media_file_id, date "
             "FROM messages_cache WHERE business_connection_id = ? AND chat_id = ? AND msg_id = ?",
             (business_connection_id, chat_id, msg_id),
         )
@@ -169,7 +176,8 @@ class Storage:
         if not row:
             return None
         keys = ["business_connection_id", "chat_id", "msg_id", "sender_id", "sender_name",
-                "sender_username", "chat_name", "chat_username", "text", "media_type", "date"]
+                "sender_username", "chat_name", "chat_username", "text", "media_type",
+                "media_kind", "media_file_id", "date"]
         return dict(zip(keys, row))
 
     async def clear_chat_cache(self, business_connection_id, chat_id):

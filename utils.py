@@ -67,6 +67,33 @@ def media_label(message: Message) -> str | None:
     return None
 
 
+# Типы медиа, которые бот умеет пересылать заново по file_id (send_photo,
+# send_video, ...). Стикеры/геолокацию/контакт/опрос не кэшируем как файл —
+# их либо бессмысленно пересылать отдельно (спойлер уже утерян), либо не
+# применимо. Достаточно фото/видео/голосовых/видеосообщений/файлов/GIF/аудио.
+def media_file(message: Message) -> tuple[str | None, str | None]:
+    """
+    Возвращает (kind, file_id) для последующей пересылки через
+    bot.send_<kind>(chat_id=..., <kind>=file_id). (None, None), если во
+    сообщении нет поддерживаемого медиа.
+    """
+    if message.photo:
+        return "photo", message.photo[-1].file_id  # последний = самое большое разрешение
+    if message.video:
+        return "video", message.video.file_id
+    if message.voice:
+        return "voice", message.voice.file_id
+    if message.video_note:
+        return "video_note", message.video_note.file_id
+    if message.document:
+        return "document", message.document.file_id
+    if message.animation:
+        return "animation", message.animation.file_id
+    if message.audio:
+        return "audio", message.audio.file_id
+    return None, None
+
+
 def html_escape(text: str) -> str:
     return _escape(text or "", quote=False)
 

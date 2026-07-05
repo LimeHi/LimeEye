@@ -10,7 +10,7 @@ from aiogram.types import BotCommand
 from config import BOT_TOKEN, CMD_PREFIX
 from storage import Storage
 from commands import COMMANDS, cmd_muted
-from utils import truncate, media_label, sender_info, chat_info, quote_html, mention_html
+from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html
 
 BOT_NAME = "LimeEye"
 
@@ -29,6 +29,23 @@ async def notify_owner(owner_chat_id: int, text: str):
         await bot.send_message(owner_chat_id, text, disable_web_page_preview=True)
     except TelegramAPIError:
         log.exception("Не удалось отправить сообщение владельцу (chat_id=%s)", owner_chat_id)
+
+
+async def send_recovered_media(owner_chat_id: int, media_kind: str | None, media_file_id: str | None):
+    """Пересылает владельцу реальный файл (не просто текстовую метку) из кэша,
+    если сообщение с этим файлом было удалено собеседником."""
+    if not owner_chat_id or not media_kind or not media_file_id:
+        return
+    method = getattr(bot, f"send_{media_kind}", None)
+    if method is None:
+        return
+    try:
+        await method(chat_id=owner_chat_id, **{media_kind: media_file_id})
+    except TelegramAPIError:
+        log.exception(
+            "Не удалось переслать восстановленный файл (%s) владельцу (chat_id=%s)",
+            media_kind, owner_chat_id,
+        )
 
 
 async def try_delete_business(business_connection_id: str, message_id: int) -> bool:
@@ -157,6 +174,7 @@ async def on_business_message(message: types.Message):
     # 3) Кэшируем — понадобится для save/edit-отчётов
     sender = sender_info(message)
     chat = chat_info(message)
+    kind, file_id = media_file(message)
     await storage.cache_message(
         business_connection_id=bc_id,
         chat_id=chat_id,
@@ -168,6 +186,8 @@ async def on_business_message(message: types.Message):
         chat_username=chat["username"],
         text=message.text or message.caption or "",
         media_type=media_label(message),
+        media_kind=kind,
+        media_file_id=file_id,
     )
 
 
@@ -199,6 +219,7 @@ async def on_edited_business_message(message: types.Message):
 
     sender = sender_info(message)
     chat = chat_info(message)
+    kind, file_id = media_file(message)
     await storage.cache_message(
         business_connection_id=bc_id,
         chat_id=chat_id,
@@ -210,6 +231,8 @@ async def on_edited_business_message(message: types.Message):
         chat_username=chat["username"],
         text=new_text,
         media_type=media_label(message),
+        media_kind=kind,
+        media_file_id=file_id,
     )
 
 
@@ -237,6 +260,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
             f"{quote_html(truncate(cached['text']))}{media}"
         )
         await notify_owner(conn["owner_chat_id"], report)
+        await send_recovered_media(conn["owner_chat_id"], cached.get("media_kind"), cached.get("media_file_id"))
 
 
 async def main():
