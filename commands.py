@@ -1,7 +1,11 @@
 import asyncio
+import logging
 import time
 
-from utils import parse_duration, human_duration, chat_info, html_escape
+from utils import parse_duration, human_duration, chat_info, sender_info, html_escape
+from tictactoe import new_board, render_text, render_keyboard
+
+log = logging.getLogger("LimeEye")
 
 HELP_TEXT = """<b>LimeEye — команды</b>
 Пишутся прямо в чате с собеседником (не боту), с префиксом «.».
@@ -12,6 +16,9 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.muted</code> — список замьюченных чатов (с юзернеймами).
 <code>.clean</code> — очистить кэш сообщений (для save/edit-отчётов) этого чата.
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
+<code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
+   Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
+<code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
 <code>.ping</code> — проверка, что бот жив.
 <code>.help</code> — это сообщение.
 
@@ -119,6 +126,59 @@ async def cmd_anim(chat_id, args, storage, bc_id, message=None, bot=None) -> str
     return None  # ничего не шлём владельцу отдельно — эффект уже виден в самом чате
 
 
+async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
+    if bot is None or message is None:
+        return "⚠️ Игра недоступна (нет доступа к боту)."
+
+    arg = (args or "").strip().lower()
+    if arg in ("stop", "cancel", "стоп"):
+        existing = await storage.get_game(bc_id, chat_id)
+        if not existing:
+            return "Игра в этом чате не запущена."
+        await storage.delete_game(bc_id, chat_id)
+        if existing.get("message_id"):
+            try:
+                await bot.edit_message_reply_markup(
+                    business_connection_id=bc_id,
+                    chat_id=chat_id,
+                    message_id=existing["message_id"],
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+        return None
+
+    x_name = sender_info(message)["name"]
+    o_name = chat_info(message)["name"]
+    board = new_board()
+    text = render_text(x_name, o_name, "X", None)
+    keyboard = render_keyboard(board, finished=False)
+
+    try:
+        sent = await bot.send_message(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        log.exception("Не удалось отправить игровое поле .tic в чат %s (bc=%s)", chat_id, bc_id)
+        return "⚠️ Не удалось начать игру (смотри логи)."
+
+    await storage.start_game(
+        business_connection_id=bc_id,
+        chat_id=chat_id,
+        board=board,
+        turn="X",
+        x_user_id=message.from_user.id,
+        x_name=x_name,
+        o_user_id=chat_id,
+        o_name=o_name,
+        message_id=sent.message_id,
+    )
+    return None
+
+
 async def cmd_ping(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     return "🏓 pong"
 
@@ -133,6 +193,7 @@ COMMANDS = {
     "muted": cmd_muted,
     "clean": cmd_clean,
     "anim": cmd_anim,
+    "tic": cmd_tic,
     "ping": cmd_ping,
     "help": cmd_help,
 }

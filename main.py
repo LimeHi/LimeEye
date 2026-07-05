@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
@@ -9,8 +9,9 @@ from aiogram.types import BotCommand
 
 from config import BOT_TOKEN, CMD_PREFIX
 from storage import Storage
-from commands import COMMANDS, cmd_muted
+from commands import COMMANDS, cmd_muted, HELP_TEXT
 from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html
+from tictactoe import EMPTY, new_board, apply_move, check_result, other_mark, render_text, render_keyboard
 
 BOT_NAME = "LimeEye"
 
@@ -75,6 +76,10 @@ async def on_direct_message(message: types.Message):
             "выбери меня и включи право «Удаление сообщений», если хочешь пользоваться .mute.\n\n"
             "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же."
         )
+        return
+
+    if message.text.startswith("/help"):
+        await message.answer(HELP_TEXT)
         return
 
     if message.text.startswith("/muted"):
@@ -263,6 +268,110 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         await send_recovered_media(conn["owner_chat_id"], cached.get("media_kind"), cached.get("media_file_id"))
 
 
+# ---------------------------------------------------------------------------
+# Крестики-нолики: нажатия на инлайн-кнопки под игровым сообщением
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data.startswith("ttt:"))
+async def on_tic_callback(callback: types.CallbackQuery):
+    data = callback.data
+    message = callback.message
+    bc_id = getattr(message, "business_connection_id", None) if message else None
+
+    if message is None or not bc_id:
+        await callback.answer()
+        return
+
+    chat_id = message.chat.id
+
+    if data == "ttt:noop":
+        await callback.answer()
+        return
+
+    game = await storage.get_game(bc_id, chat_id)
+    if not game:
+        await callback.answer("Игра не найдена или уже завершена.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+
+    # --- перезапуск после завершённой игры ---
+    if data == "ttt:restart":
+        if game["status"] != "finished":
+            await callback.answer("Игра ещё не закончена.", show_alert=True)
+            return
+        if user_id not in (game["x_user_id"], game["o_user_id"]):
+            await callback.answer("Ты не участвуешь в этой игре.", show_alert=True)
+            return
+
+        board = new_board()
+        await storage.update_game_board(bc_id, chat_id, board, "X", "playing")
+        text = render_text(game["x_name"], game["o_name"], "X", None)
+        keyboard = render_keyboard(board, finished=False)
+        try:
+            await bot.edit_message_text(
+                business_connection_id=bc_id, chat_id=chat_id,
+                message_id=message.message_id, text=text, reply_markup=keyboard,
+            )
+        except TelegramAPIError:
+            log.exception("Не удалось перезапустить игру в чате %s", chat_id)
+        await callback.answer("Новая игра!")
+        return
+
+    if game["status"] == "finished":
+        await callback.answer("Игра уже завершена — нажми «Играть снова».", show_alert=True)
+        return
+
+    if game.get("message_id") and message.message_id != game["message_id"]:
+        await callback.answer("Это старая игра, начни новую через .tic", show_alert=True)
+        return
+
+    # --- ход в клетку ---
+    try:
+        index = int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    if not (0 <= index <= 8):
+        await callback.answer()
+        return
+
+    turn = game["turn"]
+    expected_user = game["x_user_id"] if turn == "X" else game["o_user_id"]
+    if user_id != expected_user:
+        if user_id not in (game["x_user_id"], game["o_user_id"]):
+            await callback.answer("Ты не участвуешь в этой игре.", show_alert=True)
+        else:
+            await callback.answer("Сейчас не твой ход.", show_alert=True)
+        return
+
+    board = game["board"]
+    if board[index] != EMPTY:
+        await callback.answer("Клетка уже занята.", show_alert=True)
+        return
+
+    board = apply_move(board, index, turn)
+    result = check_result(board)
+
+    if result is None:
+        next_turn = other_mark(turn)
+        await storage.update_game_board(bc_id, chat_id, board, next_turn, "playing")
+        text = render_text(game["x_name"], game["o_name"], next_turn, None)
+        keyboard = render_keyboard(board, finished=False)
+    else:
+        await storage.update_game_board(bc_id, chat_id, board, turn, "finished")
+        text = render_text(game["x_name"], game["o_name"], turn, result)
+        keyboard = render_keyboard(board, finished=True)
+
+    try:
+        await bot.edit_message_text(
+            business_connection_id=bc_id, chat_id=chat_id,
+            message_id=message.message_id, text=text, reply_markup=keyboard,
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось обновить доску игры в чате %s", chat_id)
+    await callback.answer()
+
+
 async def main():
     await storage.init()
     me = await bot.get_me()
@@ -272,6 +381,7 @@ async def main():
     # через префикс CMD_PREFIX). /muted показывает список замьюченных чатов.
     await bot.set_my_commands([
         BotCommand(command="start", description="Информация о боте"),
+        BotCommand(command="help", description="Все команды бота (для чатов с собеседниками)"),
         BotCommand(command="muted", description="Список замьюченных чатов"),
     ])
 

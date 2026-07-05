@@ -42,6 +42,21 @@ CREATE TABLE IF NOT EXISTS muted_chats (
     chat_username TEXT,
     PRIMARY KEY (business_connection_id, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS tic_games (
+    business_connection_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER,
+    board TEXT NOT NULL,        -- 9 символов: '.', 'X', 'O'
+    turn TEXT NOT NULL,         -- 'X' или 'O' — чей сейчас ход
+    status TEXT NOT NULL,       -- 'playing' | 'finished'
+    x_user_id INTEGER,
+    x_name TEXT,
+    o_user_id INTEGER,
+    o_name TEXT,
+    updated_at INTEGER,
+    PRIMARY KEY (business_connection_id, chat_id)
+);
 """
 
 # Колонки, добавленные уже после первого релиза — накатываются на существующие
@@ -243,3 +258,64 @@ class Storage:
         )
         rows = await cur.fetchall()
         return [row[0] for row in rows]
+
+    # ---------- крестики-нолики ----------
+
+    async def start_game(self, business_connection_id, chat_id, board, turn,
+                          x_user_id, x_name, o_user_id, o_name, message_id=None):
+        await self._db.execute(
+            """INSERT INTO tic_games
+               (business_connection_id, chat_id, message_id, board, turn, status,
+                x_user_id, x_name, o_user_id, o_name, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'playing', ?, ?, ?, ?, ?)
+               ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
+                 message_id=excluded.message_id,
+                 board=excluded.board,
+                 turn=excluded.turn,
+                 status='playing',
+                 x_user_id=excluded.x_user_id,
+                 x_name=excluded.x_name,
+                 o_user_id=excluded.o_user_id,
+                 o_name=excluded.o_name,
+                 updated_at=excluded.updated_at
+            """,
+            (business_connection_id, chat_id, message_id, board, turn,
+             x_user_id, x_name, o_user_id, o_name, int(time.time())),
+        )
+        await self._db.commit()
+
+    async def set_game_message_id(self, business_connection_id, chat_id, message_id):
+        await self._db.execute(
+            "UPDATE tic_games SET message_id = ? WHERE business_connection_id = ? AND chat_id = ?",
+            (message_id, business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    async def get_game(self, business_connection_id, chat_id):
+        cur = await self._db.execute(
+            "SELECT business_connection_id, chat_id, message_id, board, turn, status, "
+            "x_user_id, x_name, o_user_id, o_name "
+            "FROM tic_games WHERE business_connection_id = ? AND chat_id = ?",
+            (business_connection_id, chat_id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        keys = ["business_connection_id", "chat_id", "message_id", "board", "turn", "status",
+                "x_user_id", "x_name", "o_user_id", "o_name"]
+        return dict(zip(keys, row))
+
+    async def update_game_board(self, business_connection_id, chat_id, board, turn, status):
+        await self._db.execute(
+            """UPDATE tic_games SET board = ?, turn = ?, status = ?, updated_at = ?
+               WHERE business_connection_id = ? AND chat_id = ?""",
+            (board, turn, status, int(time.time()), business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    async def delete_game(self, business_connection_id, chat_id):
+        await self._db.execute(
+            "DELETE FROM tic_games WHERE business_connection_id = ? AND chat_id = ?",
+            (business_connection_id, chat_id),
+        )
+        await self._db.commit()
