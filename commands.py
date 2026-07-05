@@ -17,6 +17,7 @@ HELP_TEXT = """<b>LimeEye — команды</b>
    Без аргумента — навсегда. Пример: <code>.mute 1h30m</code>, <code>.mute 2d</code>, <code>.mute</code>
 <code>.unmute</code> — снять мьют с этого чата.
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
+<code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
    Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
@@ -125,6 +126,48 @@ async def cmd_anim(chat_id, args, storage, bc_id, message=None, bot=None) -> str
     return None  # ничего не шлём владельцу отдельно — эффект уже виден в самом чате
 
 
+SPAM_MAX_COUNT = 50
+SPAM_DELAY_SECONDS = 0.35  # пауза между сообщениями, чтобы не словить flood-лимит
+
+
+async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    if bot is None:
+        return "⚠️ Команда недоступна (нет доступа к боту)."
+
+    parts = (args or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        return (
+            "⚠️ Формат: <code>.spam N текст</code>, где N — число повторов "
+            f"(максимум {SPAM_MAX_COUNT}). Пример: <code>.spam 5 привет</code>"
+        )
+
+    count = int(parts[0])
+    text = parts[1]
+
+    if count <= 0:
+        return "⚠️ Число повторов должно быть больше нуля."
+    if count > SPAM_MAX_COUNT:
+        return f"⚠️ Максимум {SPAM_MAX_COUNT} сообщений за раз (запрошено {count})."
+
+    sent_count = 0
+    try:
+        for _ in range(count):
+            await bot.send_message(
+                business_connection_id=bc_id,
+                chat_id=chat_id,
+                text=text,
+                parse_mode=None,  # отправляем как есть, без разбора HTML-сущностей
+            )
+            sent_count += 1
+            if sent_count < count:
+                await asyncio.sleep(SPAM_DELAY_SECONDS)
+    except TelegramAPIError:
+        log.exception("Ошибка .spam в чате %s (bc=%s) после %s из %s сообщений", chat_id, bc_id, sent_count, count)
+        return f"⚠️ Отправлено {sent_count} из {count} — дальше упёрлось в ошибку (смотри логи)."
+
+    return f"📨 Отправлено {sent_count} сообщений."
+
+
 async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     if bot is None or message is None:
         return "⚠️ Игра недоступна (нет доступа к боту)."
@@ -215,6 +258,7 @@ COMMANDS = {
     "mute": cmd_mute,
     "unmute": cmd_unmute,
     "anim": cmd_anim,
+    "spam": cmd_spam,
     "tic": cmd_tic,
     "help": cmd_help,
 }
@@ -279,6 +323,34 @@ HELP_ITEMS = [
                 "button": "Пример использования",
                 "title": ".anim текст",
                 "desc": "<code>.anim привет, как дела?</code>",
+            },
+        ],
+    },
+    {
+        "key": "spam",
+        "button": "📨 .spam",
+        "title": "📨 .spam N текст",
+        "desc": (
+            "Отправляет одно и то же сообщение N раз подряд в этот чат. "
+            f"Максимум {SPAM_MAX_COUNT} сообщений за один вызов — если запросить больше, "
+            "бот откажет и попросит уменьшить число."
+        ),
+        "subs": [
+            {
+                "key": "usage",
+                "button": "Пример использования",
+                "title": ".spam N текст",
+                "desc": "<code>.spam 5 привет</code> — отправит «привет» 5 раз подряд.",
+            },
+            {
+                "key": "limit",
+                "button": "Ограничение",
+                "title": "Лимит .spam",
+                "desc": (
+                    f"Больше {SPAM_MAX_COUNT} сообщений за раз отправить нельзя — это "
+                    "защита от случайного флуда/бана аккаунта. Если нужно больше — "
+                    "вызови команду ещё раз."
+                ),
             },
         ],
     },
