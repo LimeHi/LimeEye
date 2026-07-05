@@ -1,11 +1,14 @@
 import asyncio
+import ast
 import logging
+import math
+import operator
 import time
 
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from utils import parse_duration, human_duration, chat_info, sender_info, html_escape, media_file, media_label
+from utils import parse_duration, human_duration, chat_info, sender_info, html_escape
 from tictactoe import new_board, render_text, render_keyboard
 
 log = logging.getLogger("LimeEye")
@@ -18,11 +21,8 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.unmute</code> — снять мьют с этого чата.
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
-<code>.save</code> — ответом на сообщение с медиа: пересылает файл (фото/видео/
-   голосовое/кружок/файл/GIF/аудио) тебе в личку с ботом. Пиши сразу, пока
-   сообщение ещё видно в чате — особенно для одноразовых/самоуничтожающихся
-   фото и видео (бот не умеет отличать их от обычных, поэтому не тянет их
-   автоматически — это надо запросить самому командой).
+<code>.cal выражение</code> — калькулятор, ответ приходит сюда, в чат с ботом.
+   Пример: <code>.cal (2 + 3) * 4 / 7</code>, <code>.cal sqrt(2) + pi</code>
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
    Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
@@ -173,58 +173,128 @@ async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str
     return f"📨 Отправлено {sent_count} сообщений."
 
 
-# Соответствие "kind" из media_file() методу отправки в aiogram Bot
-_SEND_METHOD_BY_KIND = {
-    "photo": "send_photo",
-    "video": "send_video",
-    "voice": "send_voice",
-    "video_note": "send_video_note",
-    "document": "send_document",
-    "animation": "send_animation",
-    "audio": "send_audio",
+# ---------------------------------------------------------------------------
+# .cal — безопасный калькулятор (без eval): разбираем выражение через ast и
+# считаем только по белому списку разрешённых операций/функций.
+# ---------------------------------------------------------------------------
+
+_CAL_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
 }
+_CAL_UNARY_OPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+_CAL_FUNCS = {
+    "sqrt": math.sqrt,
+    "abs": abs,
+    "round": round,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "log": math.log,      # log(x) или log(x, base)
+    "log10": math.log10,
+    "log2": math.log2,
+    "exp": math.exp,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "factorial": math.factorial,
+    "min": min,
+    "max": max,
+}
+_CAL_CONSTS = {
+    "pi": math.pi,
+    "e": math.e,
+}
+_CAL_MAX_POWER_EXPONENT = 1000  # защита от x ** 999999999 (завешивает CPU)
 
 
-async def cmd_save(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
-    """
-    .save — команда пишется ОТВЕТОМ на сообщение с медиа. Пересылает файл
-    (фото/видео/голосовое/кружок/файл/GIF/аудио) себе в личку с ботом.
+class CalError(Exception):
+    pass
 
-    Важно: Telegram Bot API не сообщает боту, является ли фото/видео
-    "одноразовым" (самоуничтожающимся) — это MTProto-уровневая метка,
-    недоступная ботам с токеном. Поэтому автоматически различать обычное и
-    одноразовое медиа технически невозможно: .save — это осознанное действие,
-    которое нужно вызвать самому, пока сообщение ещё видно в чате (не после
-    того, как оно уже пропало).
-    """
-    if bot is None or message is None:
-        return "⚠️ Команда недоступна."
 
-    replied = message.reply_to_message
-    if not replied:
-        return "⚠️ Команду нужно отправлять ответом на сообщение с медиа: ответь на фото/видео и напиши .save"
+def _cal_eval_node(node):
+    if isinstance(node, ast.Expression):
+        return _cal_eval_node(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise CalError("Разрешены только числа.")
+    if isinstance(node, ast.BinOp):
+        op = _CAL_BIN_OPS.get(type(node.op))
+        if op is None:
+            raise CalError("Неподдерживаемая операция.")
+        left = _cal_eval_node(node.left)
+        right = _cal_eval_node(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > _CAL_MAX_POWER_EXPONENT:
+            raise CalError("Слишком большая степень.")
+        try:
+            return op(left, right)
+        except ZeroDivisionError:
+            raise CalError("Деление на ноль.")
+    if isinstance(node, ast.UnaryOp):
+        op = _CAL_UNARY_OPS.get(type(node.op))
+        if op is None:
+            raise CalError("Неподдерживаемая операция.")
+        return op(_cal_eval_node(node.operand))
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _CAL_FUNCS:
+            raise CalError("Неизвестная функция.")
+        if node.keywords:
+            raise CalError("Именованные аргументы не поддерживаются.")
+        args = [_cal_eval_node(a) for a in node.args]
+        try:
+            return _CAL_FUNCS[node.func.id](*args)
+        except (ValueError, TypeError, OverflowError) as e:
+            raise CalError(f"Ошибка в функции {node.func.id}: {e}")
+    if isinstance(node, ast.Name):
+        if node.id in _CAL_CONSTS:
+            return _CAL_CONSTS[node.id]
+        raise CalError(f"Неизвестное имя: {node.id}")
+    raise CalError("Неподдерживаемое выражение.")
 
-    kind, file_id = media_file(replied)
-    if not kind:
-        return "⚠️ В сообщении, на которое ты ответил, нет медиа, которое можно сохранить."
 
-    conn = await storage.get_connection(bc_id)
-    if not conn:
-        return "⚠️ Не найдено подключение — не знаю, куда прислать файл."
+def cal_evaluate(expr: str) -> float:
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        raise CalError("Не удалось разобрать выражение — проверь синтаксис.")
+    return _cal_eval_node(tree)
 
-    send_method_name = _SEND_METHOD_BY_KIND.get(kind)
-    method = getattr(bot, send_method_name, None) if send_method_name else None
-    if method is None:
-        return "⚠️ Этот тип медиа пока не поддерживается для сохранения."
+
+def _cal_format(value) -> str:
+    if isinstance(value, float):
+        if value.is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return f"{value:.10g}"
+    return str(value)
+
+
+async def cmd_cal(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    expr = (args or "").strip()
+    if not expr:
+        return (
+            "⚠️ Формат: <code>.cal выражение</code>\n"
+            "Пример: <code>.cal (2 + 3) * 4 / 7</code>, <code>.cal sqrt(2) + pi</code>"
+        )
 
     try:
-        await method(chat_id=conn["owner_chat_id"], **{kind: file_id})
-    except TelegramAPIError:
-        log.exception("Не удалось переслать медиа через .save (bc=%s, chat=%s)", bc_id, chat_id)
-        return "⚠️ Не удалось переслать файл (возможно, он уже недоступен — смотри логи)."
+        result = cal_evaluate(expr)
+    except CalError as e:
+        return f"⚠️ {e}"
+    except RecursionError:
+        return "⚠️ Выражение слишком сложное."
+    except Exception:
+        log.exception(".cal: не удалось посчитать выражение %r", expr)
+        return "⚠️ Не удалось посчитать (проверь выражение)."
 
-    label = media_label(replied) or "Медиа"
-    return f"💾 {label} сохранено выше."
+    return f"🧮 <code>{html_escape(expr)}</code> = <b>{html_escape(_cal_format(result))}</b>"
 
 
 async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
@@ -318,7 +388,7 @@ COMMANDS = {
     "unmute": cmd_unmute,
     "anim": cmd_anim,
     "spam": cmd_spam,
-    "save": cmd_save,
+    "cal": cmd_cal,
     "tic": cmd_tic,
     "help": cmd_help,
 }
@@ -415,27 +485,26 @@ HELP_ITEMS = [
         ],
     },
     {
-        "key": "save",
-        "button": "💾 .save",
-        "title": "💾 .save",
+        "key": "cal",
+        "button": "🧮 .cal",
+        "title": "🧮 .cal выражение",
         "desc": (
-            "Пишется ОТВЕТОМ на сообщение с медиа — пересылает файл (фото/видео/голосовое/"
-            "кружок/файл/GIF/аудио) тебе в личку с ботом.\n\n"
-            "Для одноразовых (самоуничтожающихся) фото и видео это единственный рабочий "
-            "способ сохранить их: Telegram Bot API не сообщает боту, какое медиа "
-            "одноразовое, а какое обычное (это MTProto-уровневая метка, недоступная ботам "
-            "с токеном) — поэтому бот не тянет файлы автоматически.\n\n"
-            "Пока сообщение ещё видно в чате — даже если собеседник уже открыл его и оно вот-"
-            "вот исчезнет с его стороны — успей ответить <code>.save</code>, и бот заберёт "
-            "файл, пока reply_to_message ещё содержит его данные. После того как сообщение "
-            "полностью пропадёт, спасти его уже не получится."
+            "Калькулятор. Считает выражение и присылает ответ сюда, в чат с ботом "
+            "(не в бизнес-чат — переписку с собеседником он не засоряет).\n\n"
+            "Поддерживает: <code>+ - * / // % **</code>, скобки, и функции "
+            "<code>sqrt, abs, round, sin, cos, tan, log, log10, log2, exp, floor, ceil, "
+            "factorial, min, max</code>, а также константы <code>pi</code> и <code>e</code>."
         ),
         "subs": [
             {
                 "key": "usage",
-                "button": "Как использовать",
-                "title": ".save",
-                "desc": "Ответь на сообщение с фото/видео и напиши <code>.save</code> — файл придёт тебе в личку с ботом.",
+                "button": "Пример использования",
+                "title": ".cal выражение",
+                "desc": (
+                    "<code>.cal (2 + 3) * 4 / 7</code>\n"
+                    "<code>.cal sqrt(2) + pi</code>\n"
+                    "<code>.cal 2 ** 10</code>"
+                ),
             },
         ],
     },
