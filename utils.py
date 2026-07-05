@@ -1,13 +1,15 @@
 import re
 from html import escape as _escape
 
+from aiogram.types import Message
+
 DURATION_RE = re.compile(r"(\d+)\s*(d|h|m|s)", re.IGNORECASE)
 UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
 
 def parse_duration(raw: str) -> int | None:
     """
-    '1h30m' -> 5400 ; '2d' -> 172800 ; '' или None -> None (значит навсегда)
+    '1h30m' -> 5400 ; '2d' -> 172800 ; '' или None -> None (навсегда)
     Бросает ValueError, если строка не пустая, но не распознана.
     """
     raw = (raw or "").strip()
@@ -22,7 +24,7 @@ def parse_duration(raw: str) -> int | None:
     return total
 
 
-def human_duration(seconds: int) -> str:
+def human_duration(seconds) -> str:
     if seconds is None:
         return "навсегда"
     parts = []
@@ -39,19 +41,30 @@ def truncate(text: str, limit: int = 800) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def media_label(message) -> str | None:
-    if not message.media:
-        return None
-    cls = message.media.__class__.__name__
-    mapping = {
-        "MessageMediaPhoto": "📷 Фото",
-        "MessageMediaDocument": "📎 Файл",
-        "MessageMediaWebPage": "🔗 Ссылка",
-        "MessageMediaGeo": "📍 Геолокация",
-        "MessageMediaContact": "👤 Контакт",
-        "MessageMediaPoll": "📊 Опрос",
-    }
-    return mapping.get(cls, f"Медиа ({cls})")
+def media_label(message: Message) -> str | None:
+    if message.photo:
+        return "📷 Фото"
+    if message.video:
+        return "🎥 Видео"
+    if message.voice:
+        return "🎤 Голосовое"
+    if message.video_note:
+        return "🎥 Видеосообщение"
+    if message.document:
+        return "📎 Файл"
+    if message.sticker:
+        return "🖼 Стикер"
+    if message.animation:
+        return "🎞 GIF"
+    if message.audio:
+        return "🎵 Аудио"
+    if message.location:
+        return "📍 Геолокация"
+    if message.contact:
+        return "👤 Контакт"
+    if message.poll:
+        return "📊 Опрос"
+    return None
 
 
 def html_escape(text: str) -> str:
@@ -59,16 +72,15 @@ def html_escape(text: str) -> str:
 
 
 def quote_html(text: str) -> str:
-    """Оборачивает текст в HTML-blockquote (визуальная 'цитата' как в самом Telegram)."""
+    """HTML blockquote — визуальная цитата, как в самом Telegram."""
     text = text if text else "(без текста)"
     return f"<blockquote>{html_escape(text)}</blockquote>"
 
 
 def mention_html(user_id, name: str, username: str | None) -> str:
     """
-    Кликабельное упоминание собеседника.
-    Если есть username — отдельно показываем @username (кликабельная ссылка на t.me/username),
-    и в скобках отображаемое имя. Если username нет — кликабельный mention по id (tg://user?id=...).
+    Кликабельное упоминание собеседника: @username (Имя) со ссылкой на t.me/username,
+    либо mention по id, если username не задан.
     """
     safe_name = html_escape(name or "без имени")
     if username:
@@ -78,36 +90,22 @@ def mention_html(user_id, name: str, username: str | None) -> str:
     return safe_name
 
 
-async def get_sender_info(event) -> dict:
-    """Возвращает {'id', 'name', 'username'} отправителя."""
-    try:
-        sender = await event.get_sender()
-    except Exception:
-        sender = None
-    if sender is None:
-        return {"id": event.sender_id, "name": "неизвестно", "username": None}
-    name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or "без имени"
-    last = getattr(sender, "last_name", None)
-    if last:
-        name = f"{name} {last}"
-    username = getattr(sender, "username", None)
-    return {"id": getattr(sender, "id", event.sender_id), "name": name, "username": username}
+def sender_info(message: Message) -> dict:
+    user = message.from_user
+    if user is None:
+        return {"id": None, "name": "неизвестно", "username": None}
+    name = user.first_name or "без имени"
+    if user.last_name:
+        name = f"{name} {user.last_name}"
+    return {"id": user.id, "name": name, "username": user.username}
 
 
-async def get_chat_info(event) -> dict:
-    """Возвращает {'id', 'name', 'username'} чата/собеседника."""
-    try:
-        chat = await event.get_chat()
-    except Exception:
-        chat = None
-    if chat is None:
-        return {"id": event.chat_id, "name": "неизвестный чат", "username": None}
+def chat_info(message: Message) -> dict:
+    chat = message.chat
     title = getattr(chat, "title", None)
-    username = getattr(chat, "username", None)
     if title:
-        return {"id": chat.id, "name": title, "username": username}
+        return {"id": chat.id, "name": title, "username": chat.username}
     first = getattr(chat, "first_name", None) or "личный чат"
-    last = getattr(chat, "last_name", None)
-    if last:
-        first = f"{first} {last}"
-    return {"id": chat.id, "name": first, "username": username}
+    if getattr(chat, "last_name", None):
+        first = f"{first} {chat.last_name}"
+    return {"id": chat.id, "name": first, "username": chat.username}

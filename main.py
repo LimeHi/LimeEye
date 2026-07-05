@@ -1,33 +1,113 @@
 import asyncio
 import logging
 
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from aiogram import Bot, Dispatcher, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 
-from config import API_ID, API_HASH, SESSION_STRING, LOG_CHAT, CMD_PREFIX
+from config import BOT_TOKEN, CMD_PREFIX
 from storage import Storage
 from commands import COMMANDS
-from utils import truncate, media_label, get_sender_info, get_chat_info, quote_html, mention_html
+from utils import truncate, media_label, sender_info, chat_info, quote_html, mention_html
 
 BOT_NAME = "LimeEye"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(BOT_NAME)
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 storage = Storage()
 
 
-# ---------------------------------------------------------------------------
-# Кэширование + мьют + диспетчер команд — всё в одном хендлере на новые сообщения
-# ---------------------------------------------------------------------------
-@client.on(events.NewMessage())
-async def on_new_message(event):
-    chat_id = event.chat_id
+async def notify_owner(owner_chat_id: int, text: str):
+    if not owner_chat_id:
+        return
+    try:
+        await bot.send_message(owner_chat_id, text, disable_web_page_preview=True)
+    except TelegramAPIError:
+        log.exception("Не удалось отправить сообщение владельцу (chat_id=%s)", owner_chat_id)
 
-    # 1) Команды через префикс "." — реагируем только на СВОИ сообщения (outgoing)
-    if event.out and event.raw_text and event.raw_text.startswith(CMD_PREFIX):
-        body = event.raw_text[len(CMD_PREFIX):].strip()
+
+async def try_delete_business(business_connection_id: str, message_id: int) -> bool:
+    try:
+        await bot.delete_business_messages(
+            business_connection_id=business_connection_id,
+            message_ids=[message_id],
+        )
+        return True
+    except TelegramAPIError:
+        log.exception("Не удалось удалить сообщение %s в подключении %s", message_id, business_connection_id)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Обычный личный чат с ботом (не Business) — на всякий случай /start
+# ---------------------------------------------------------------------------
+@dp.message()
+async def on_direct_message(message: types.Message):
+    if message.text and message.text.startswith("/start"):
+        await message.answer(
+            f"👋 {BOT_NAME} запущен.\n\n"
+            "Подключи меня к своему аккаунту: Настройки → Telegram Business → Чат-боты, "
+            "выбери меня и включи право «Удаление сообщений», если хочешь пользоваться .mute.\n\n"
+            "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Подключение/обновление прав Business-аккаунта
+# ---------------------------------------------------------------------------
+@dp.business_connection()
+async def on_business_connection(bc: types.BusinessConnection):
+    rights = bc.rights
+    can_reply = bool(getattr(rights, "can_reply", None) or getattr(bc, "can_reply", False))
+    can_read = bool(getattr(rights, "can_read_messages", False))
+    can_delete_sent = bool(
+        getattr(rights, "can_delete_sent_messages", None)
+        or getattr(rights, "can_delete_outgoing_messages", False)
+    )
+    can_delete_all = bool(getattr(rights, "can_delete_all_messages", False))
+
+    await storage.upsert_connection(
+        business_connection_id=bc.id,
+        owner_user_id=bc.user.id,
+        owner_chat_id=bc.user_chat_id,
+        can_reply=can_reply,
+        can_read_messages=can_read,
+        can_delete_sent_messages=can_delete_sent,
+        can_delete_all_messages=can_delete_all,
+        is_enabled=bc.is_enabled,
+    )
+    log.info(
+        "Business connection %s: enabled=%s delete_all=%s delete_sent=%s",
+        bc.id, bc.is_enabled, can_delete_all, can_delete_sent,
+    )
+    if bc.is_enabled:
+        note = "✅ Подключение активно."
+        if not can_delete_all:
+            note += (
+                "\n⚠️ Право «Удаление сообщений» не выдано — команда .mute и очистка "
+                "команд из чата работать не будут, но save/edit-отчёты работают."
+            )
+        await notify_owner(bc.user_chat_id, f"{BOT_NAME}\n{note}")
+
+
+# ---------------------------------------------------------------------------
+# Новое сообщение в чате Business-аккаунта
+# ---------------------------------------------------------------------------
+@dp.business_message()
+async def on_business_message(message: types.Message):
+    bc_id = message.business_connection_id
+    chat_id = message.chat.id
+    conn = await storage.get_connection(bc_id)
+
+    is_owner = conn is not None and message.from_user and message.from_user.id == conn["owner_user_id"]
+
+    # 1) Команды через префикс "." — только от владельца аккаунта
+    if is_owner and message.text and message.text.startswith(CMD_PREFIX):
+        body = message.text[len(CMD_PREFIX):].strip()
         if body:
             parts = body.split(maxsplit=1)
             name = parts[0].lower()
@@ -35,72 +115,52 @@ async def on_new_message(event):
             handler = COMMANDS.get(name)
             if handler:
                 try:
-                    await handler(event, args, storage, client)
+                    reply = await handler(chat_id, args, storage, bc_id)
                 except Exception:
                     log.exception("Ошибка выполнения команды %s", name)
-                    await event.edit(f"⚠️ Ошибка при выполнении .{name}, смотри логи.")
+                    reply = f"⚠️ Ошибка при выполнении .{name}, смотри логи."
+                await notify_owner(conn["owner_chat_id"], reply)
+                if conn["can_delete_all_messages"] or conn["can_delete_sent_messages"]:
+                    await try_delete_business(bc_id, message.message_id)
                 return  # команду не кэшируем и не проверяем на мьют
 
-    # 2) Если чат замьючен — удаляем входящее сообщение (не трогаем свои исходящие)
-    if not event.out and await storage.is_muted(chat_id):
-        try:
-            await event.delete()
-        except Exception:
-            log.exception("Не удалось удалить сообщение в замьюченном чате %s", chat_id)
+    # 2) Если чат замьючен — удаляем входящее (не от владельца)
+    if not is_owner and conn and await storage.is_muted(bc_id, chat_id):
+        if conn["can_delete_all_messages"]:
+            await try_delete_business(bc_id, message.message_id)
         return  # замьюченное сообщение не кэшируем
 
-    # 3) Кэшируем сообщение (нужно, чтобы потом восстановить текст при удалении/правке)
-    sender = await get_sender_info(event)
-    chat = await get_chat_info(event)
+    # 3) Кэшируем — понадобится для save/edit-отчётов
+    sender = sender_info(message)
+    chat = chat_info(message)
     await storage.cache_message(
+        business_connection_id=bc_id,
         chat_id=chat_id,
-        msg_id=event.id,
+        msg_id=message.message_id,
         sender_id=sender["id"],
         sender_name=sender["name"],
         sender_username=sender["username"],
         chat_name=chat["name"],
         chat_username=chat["username"],
-        text=event.raw_text or "",
-        media_type=media_label(event.message),
+        text=message.text or message.caption or "",
+        media_type=media_label(message),
     )
 
 
 # ---------------------------------------------------------------------------
-# Удалённые сообщения
+# Изменённое сообщение
 # ---------------------------------------------------------------------------
-@client.on(events.MessageDeleted())
-async def on_message_deleted(event):
-    chat_id = event.chat_id
-    if chat_id is None:
-        return  # Telegram иногда не даёт chat_id для приватных удалений — пропускаем
-    for msg_id in event.deleted_ids:
-        cached = await storage.get_cached(chat_id, msg_id)
-        if not cached:
-            continue  # не было в кэше — нечего показать
+@dp.edited_business_message()
+async def on_edited_business_message(message: types.Message):
+    bc_id = message.business_connection_id
+    chat_id = message.chat.id
+    conn = await storage.get_connection(bc_id)
+    if not conn:
+        return
 
-        who = mention_html(cached["sender_id"], cached["sender_name"], cached["sender_username"])
-        media = f"\n{cached['media_type']}" if cached["media_type"] else ""
-        report = (
-            f"🗑 <b>Удалённое сообщение</b>\n"
-            f"Чат: {cached['chat_name']}\n"
-            f"От: {who}\n\n"
-            f"{quote_html(truncate(cached['text']))}{media}"
-        )
-        try:
-            await client.send_message(LOG_CHAT, report, parse_mode="html", link_preview=False)
-        except Exception:
-            log.exception("Не удалось отправить отчёт об удалении")
-
-
-# ---------------------------------------------------------------------------
-# Изменённые сообщения
-# ---------------------------------------------------------------------------
-@client.on(events.MessageEdited())
-async def on_message_edited(event):
-    chat_id = event.chat_id
-    cached = await storage.get_cached(chat_id, event.id)
+    cached = await storage.get_cached(bc_id, chat_id, message.message_id)
     old_text = cached["text"] if cached else None
-    new_text = event.raw_text or ""
+    new_text = message.text or message.caption or ""
 
     if old_text is not None and old_text != new_text:
         who = mention_html(cached["sender_id"], cached["sender_name"], cached["sender_username"])
@@ -111,33 +171,55 @@ async def on_message_edited(event):
             f"<b>Было:</b>\n{quote_html(truncate(old_text))}\n"
             f"<b>Стало:</b>\n{quote_html(truncate(new_text))}"
         )
-        try:
-            await client.send_message(LOG_CHAT, report, parse_mode="html", link_preview=False)
-        except Exception:
-            log.exception("Не удалось отправить отчёт об изменении")
+        await notify_owner(conn["owner_chat_id"], report)
 
-    # обновляем кэш новым текстом в любом случае
-    sender = await get_sender_info(event)
-    chat = await get_chat_info(event)
+    sender = sender_info(message)
+    chat = chat_info(message)
     await storage.cache_message(
+        business_connection_id=bc_id,
         chat_id=chat_id,
-        msg_id=event.id,
+        msg_id=message.message_id,
         sender_id=sender["id"],
         sender_name=sender["name"],
         sender_username=sender["username"],
         chat_name=chat["name"],
         chat_username=chat["username"],
         text=new_text,
-        media_type=media_label(event.message),
+        media_type=media_label(message),
     )
+
+
+# ---------------------------------------------------------------------------
+# Удалённые сообщения
+# ---------------------------------------------------------------------------
+@dp.deleted_business_messages()
+async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
+    bc_id = event.business_connection_id
+    chat_id = event.chat.id
+    conn = await storage.get_connection(bc_id)
+    if not conn:
+        return
+
+    for msg_id in event.message_ids:
+        cached = await storage.get_cached(bc_id, chat_id, msg_id)
+        if not cached:
+            continue
+        who = mention_html(cached["sender_id"], cached["sender_name"], cached["sender_username"])
+        media = f"\n{cached['media_type']}" if cached["media_type"] else ""
+        report = (
+            f"🗑 <b>Удалённое сообщение</b>\n"
+            f"Чат: {cached['chat_name']}\n"
+            f"От: {who}\n\n"
+            f"{quote_html(truncate(cached['text']))}{media}"
+        )
+        await notify_owner(conn["owner_chat_id"], report)
 
 
 async def main():
     await storage.init()
-    await client.start()
-    me = await client.get_me()
-    log.info("%s запущен как %s (id=%s)", BOT_NAME, me.username or me.first_name, me.id)
-    await client.run_until_disconnected()
+    me = await bot.get_me()
+    log.info("%s запущен как @%s", BOT_NAME, me.username)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":

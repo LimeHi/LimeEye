@@ -1,69 +1,63 @@
 from utils import parse_duration, human_duration
 
-HELP_TEXT = """**LimeEye — команды**
+HELP_TEXT = """<b>LimeEye — команды</b>
+Пишутся прямо в чате с собеседником (не боту), с префиксом «.».
 
-`.mute [время]` — глушить входящие сообщения в этом чате (удалять их сразу).
-   Без аргумента — навсегда. Пример: `.mute 1h30m`, `.mute 2d`, `.mute`
-`.unmute` — снять мьют с этого чата.
-`.muted` — список замьюченных чатов.
-`.clean` — очистить кэш сообщений (для .save/.edit отчётов) этого чата.
-`.ping` — проверка, что юзербот жив.
-`.help` — это сообщение.
+<code>.mute [время]</code> — глушить входящие сообщения в этом чате (удалять их сразу).
+   Без аргумента — навсегда. Пример: <code>.mute 1h30m</code>, <code>.mute 2d</code>, <code>.mute</code>
+<code>.unmute</code> — снять мьют с этого чата.
+<code>.muted</code> — список замьюченных чатов.
+<code>.clean</code> — очистить кэш сообщений (для save/edit-отчётов) этого чата.
+<code>.ping</code> — проверка, что бот жив.
+<code>.help</code> — это сообщение.
+
+Учти: для <code>.mute</code>/<code>.clean</code> и очистки самой команды из чата
+нужно, чтобы при подключении бота в Settings → Telegram Business → Chatbots
+было включено право «Delete messages» (можно удалять чужие сообщения).
 """
 
 
-async def cmd_mute(event, args, storage, client):
-    chat_id = event.chat_id
+async def cmd_mute(chat_id, args, storage, bc_id) -> str:
     try:
         seconds = parse_duration(args)
     except ValueError as e:
-        await event.edit(f"⚠️ {e}")
-        return
-    await storage.mute_chat(chat_id, seconds)
+        return f"⚠️ {e}"
+    await storage.mute_chat(bc_id, chat_id, seconds)
     label = human_duration(seconds) if seconds else "навсегда"
-    await event.edit(f"🔇 Чат замьючен ({label}). Входящие сообщения будут удаляться.")
+    return f"🔇 Чат замьючен ({label}). Входящие сообщения будут удаляться."
 
 
-async def cmd_unmute(event, args, storage, client):
-    await storage.unmute_chat(event.chat_id)
-    await event.edit("🔊 Мьют снят с этого чата.")
+async def cmd_unmute(chat_id, args, storage, bc_id) -> str:
+    await storage.unmute_chat(bc_id, chat_id)
+    return "🔊 Мьют снят с этого чата."
 
 
-async def cmd_muted(event, args, storage, client):
-    rows = await storage.list_muted()
+async def cmd_muted(chat_id, args, storage, bc_id) -> str:
+    rows = await storage.list_muted(bc_id)
     if not rows:
-        await event.edit("Замьюченных чатов нет.")
-        return
+        return "Замьюченных чатов нет."
+    import time
     lines = []
-    for chat_id, until_ts in rows:
-        try:
-            entity = await client.get_entity(chat_id)
-            name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
-            username = getattr(entity, "username", None)
-            if username:
-                name = f"{name} (@{username})"
-        except Exception:
-            name = str(chat_id)
+    for muted_chat_id, until_ts in rows:
         if until_ts:
-            import time
             remaining = max(0, int(until_ts - time.time()))
-            lines.append(f"• {name} — ещё {human_duration(remaining)}")
+            lines.append(f"• {muted_chat_id} — ещё {human_duration(remaining)}")
         else:
-            lines.append(f"• {name} — навсегда")
-    await event.edit("🔇 **Замьюченные чаты:**\n" + "\n".join(lines))
+            lines.append(f"• {muted_chat_id} — навсегда")
+    return "🔇 <b>Замьюченные чаты:</b>\n" + "\n".join(lines)
 
 
-async def cmd_clean(event, args, storage, client):
-    await storage.clear_chat_cache(event.chat_id)
-    await event.edit("🧹 Кэш сообщений этого чата очищен.")
+async def cmd_clean(chat_id, args, storage, bc_id) -> str:
+    await storage.clear_chat_cache(bc_id, chat_id)
+    return "🧹 Кэш сообщений этого чата очищен."
 
 
-async def cmd_ping(event, args, storage, client):
-    await event.edit("🏓 pong")
+async def cmd_ping(chat_id, args, storage, bc_id) -> str:
+    return "🏓 pong"
 
 
-async def cmd_help(event, args, storage, client):
-    await event.edit(HELP_TEXT)
+async def cmd_help(chat_id, args, storage, bc_id) -> str:
+    return HELP_TEXT
 
 
 COMMANDS = {
