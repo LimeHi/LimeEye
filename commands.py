@@ -51,7 +51,16 @@ async def cmd_mute(chat_id, args, storage, bc_id, message=None, bot=None) -> str
 
 async def cmd_unmute(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     await storage.unmute_chat(bc_id, chat_id)
-    return "🔊 Мьют снят с этого чата."
+
+    who = ""
+    if message is not None:
+        info = chat_info(message)
+        if info["username"]:
+            who = f" (@{info['username']})"
+        elif info["name"]:
+            who = f" ({info['name']})"
+
+    return f"🔊 Мьют снят с чата{who}."
 
 
 async def cmd_muted(chat_id, args, storage, bc_id, message=None, bot=None) -> str:

@@ -108,6 +108,13 @@ async def on_business_connection(bc: types.BusinessConnection):
                 "команд из чата работать не будут, но save/edit-отчёты работают."
             )
         await notify_owner(bc.user_chat_id, f"{BOT_NAME}\n{note}")
+    else:
+        await notify_owner(
+            bc.user_chat_id,
+            f"🔌 {BOT_NAME}\n"
+            "Бот отключён от Telegram Business (Настройки → Telegram Business → Чат-боты).\n"
+            "Пока подключение не восстановлено, save/edit-отчёты, .mute и остальные команды работать не будут."
+        )
 
 
 # ---------------------------------------------------------------------------
