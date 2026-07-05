@@ -182,6 +182,18 @@ async def on_business_message(message: types.Message):
             await try_delete_business(bc_id, message.message_id)
         return  # замьюченное сообщение не кэшируем
 
+    # 2.5) Сохранение медиа через ответ: если владелец отвечает любым текстом
+    # на сообщение с медиа (в т.ч. одноразовое/самоуничтожающееся фото или
+    # видео), пока оно ещё доступно в reply_to_message, — пересылаем файл
+    # себе в личку с ботом, чтобы он не пропал после просмотра/исчезновения.
+    if is_owner and message.text and message.reply_to_message:
+        replied = message.reply_to_message
+        kind, file_id = media_file(replied)
+        if kind and file_id:
+            label = media_label(replied) or "Медиа"
+            await send_recovered_media(conn["owner_chat_id"], kind, file_id)
+            await notify_owner(conn["owner_chat_id"], f"💾 {label} из ответа сохранено выше (файл прикреплён).")
+
     # 3) Кэшируем — понадобится для save/edit-отчётов
     sender = sender_info(message)
     chat = chat_info(message)
