@@ -202,6 +202,17 @@ class Storage:
         )
         await self._db.commit()
 
+    async def purge_old_cache(self, max_age_seconds: int) -> int:
+        """Удаляет из кэша сообщения старше max_age_seconds. Возвращает число
+        удалённых строк — вызывается периодически вместо ручной .clean."""
+        cutoff = int(time.time()) - max_age_seconds
+        cur = await self._db.execute(
+            "DELETE FROM messages_cache WHERE date < ?",
+            (cutoff,),
+        )
+        await self._db.commit()
+        return cur.rowcount
+
     # ---------- замьюченные чаты ----------
 
     async def mute_chat(self, business_connection_id, chat_id, duration_seconds: int | None,

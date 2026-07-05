@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand
 
-from config import BOT_TOKEN, CMD_PREFIX
+from config import BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS
 from storage import Storage
 from commands import (
     COMMANDS, cmd_muted, HELP_TEXT,
@@ -416,6 +416,23 @@ async def on_tic_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
+CACHE_PURGE_INTERVAL_SECONDS = 6 * 3600  # проверяем раз в 6 часов
+
+
+async def cache_purge_loop():
+    """Фоновая задача: раз в CACHE_PURGE_INTERVAL_SECONDS удаляет из кэша
+    сообщения старше CACHE_MAX_AGE_DAYS — заменяет ручную команду .clean."""
+    max_age_seconds = int(CACHE_MAX_AGE_DAYS * 86400)
+    while True:
+        try:
+            removed = await storage.purge_old_cache(max_age_seconds)
+            if removed:
+                log.info("Автоочистка кэша: удалено %s старых сообщений", removed)
+        except Exception:
+            log.exception("Ошибка автоочистки кэша")
+        await asyncio.sleep(CACHE_PURGE_INTERVAL_SECONDS)
+
+
 async def main():
     await storage.init()
     me = await bot.get_me()
@@ -428,6 +445,8 @@ async def main():
         BotCommand(command="help", description="Все команды бота (для чатов с собеседниками)"),
         BotCommand(command="muted", description="Список замьюченных чатов"),
     ])
+
+    asyncio.create_task(cache_purge_loop())
 
     await dp.start_polling(bot)
 

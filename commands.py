@@ -16,18 +16,19 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.mute [время]</code> — глушить входящие сообщения в этом чате (удалять их сразу).
    Без аргумента — навсегда. Пример: <code>.mute 1h30m</code>, <code>.mute 2d</code>, <code>.mute</code>
 <code>.unmute</code> — снять мьют с этого чата.
-<code>.muted</code> — список замьюченных чатов (с юзернеймами).
-<code>.clean</code> — очистить кэш сообщений (для save/edit-отчётов) этого чата.
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
    Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
-<code>.ping</code> — проверка, что бот жив.
 <code>.help</code> — это сообщение.
 
-Учти: для <code>.mute</code>/<code>.clean</code> и очистки самой команды из чата
-нужно, чтобы при подключении бота в Settings → Telegram Business → Chatbots
-было включено право «Delete messages» (можно удалять чужие сообщения).
+Список замьюченных чатов смотри командой /muted прямо в чате с ботом (не здесь).
+Кэш сообщений (для save/edit-отчётов) очищается автоматически сам через
+несколько дней — вручную чистить не нужно.
+
+Учти: для <code>.mute</code> и очистки самой команды из чата нужно, чтобы при
+подключении бота в Settings → Telegram Business → Chatbots было включено
+право «Delete messages» (можно удалять чужие сообщения).
 """
 
 
@@ -88,11 +89,6 @@ async def cmd_muted(chat_id, args, storage, bc_id, message=None, bot=None) -> st
     return "🔇 <b>Замьюченные чаты:</b>\n" + "\n".join(lines)
 
 
-async def cmd_clean(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
-    await storage.clear_chat_cache(bc_id, chat_id)
-    return "🧹 Кэш сообщений этого чата очищен."
-
-
 async def cmd_anim(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     text = (args or "").strip()
     if not text:
@@ -139,24 +135,24 @@ async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str 
         if not existing:
             return "Игра в этом чате не запущена."
         await storage.delete_game(bc_id, chat_id)
+
+        outcome = "не найдено (уже удалено?)"
         if existing.get("message_id"):
             # Сначала пробуем удалить само игровое сообщение целиком — так в
             # чате не остаётся "зависшего" заголовка/статуса хода. Если прав
             # на удаление нет, тогда хотя бы обновляем текст на "игра
             # остановлена" и убираем кнопки.
-            deleted = False
             try:
                 await bot.delete_business_messages(
                     business_connection_id=bc_id,
                     message_ids=[existing["message_id"]],
                 )
-                deleted = True
+                outcome = "сообщение с игрой удалено из чата"
             except TelegramAPIError:
                 log.info(
                     "Не удалось удалить игровое сообщение %s в чате %s (нет прав?), "
                     "обновляю текст вместо удаления", existing["message_id"], chat_id,
                 )
-            if not deleted:
                 try:
                     stopped_text = (
                         "❌⭕ <b>Крестики-нолики</b>\n"
@@ -170,12 +166,15 @@ async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str 
                         text=stopped_text,
                         reply_markup=None,
                     )
+                    outcome = "нет права на удаление — заменил текст на «игра остановлена»"
                 except TelegramAPIError:
                     log.exception(
                         "Не удалось обновить игровое сообщение %s в чате %s после stop",
                         existing["message_id"], chat_id,
                     )
-        return None
+                    outcome = "не удалось ни удалить, ни обновить сообщение (смотри логи)"
+
+        return f"⏹ Игра остановлена ({outcome})."
 
     x_name = sender_info(message)["name"]
     o_name = chat_info(message)["name"]
@@ -208,10 +207,6 @@ async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str 
     return None
 
 
-async def cmd_ping(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
-    return "🏓 pong"
-
-
 async def cmd_help(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     return HELP_TEXT
 
@@ -219,11 +214,8 @@ async def cmd_help(chat_id, args, storage, bc_id, message=None, bot=None) -> str
 COMMANDS = {
     "mute": cmd_mute,
     "unmute": cmd_unmute,
-    "muted": cmd_muted,
-    "clean": cmd_clean,
     "anim": cmd_anim,
     "tic": cmd_tic,
-    "ping": cmd_ping,
     "help": cmd_help,
 }
 
@@ -274,27 +266,6 @@ HELP_ITEMS = [
         "subs": [],
     },
     {
-        "key": "muted",
-        "button": "📋 .muted",
-        "title": "📋 .muted",
-        "desc": (
-            "Показывает список всех замьюченных чатов: с юзернеймом/именем и оставшимся "
-            "временем (или пометкой «навсегда»)."
-        ),
-        "subs": [],
-    },
-    {
-        "key": "clean",
-        "button": "🧹 .clean",
-        "title": "🧹 .clean",
-        "desc": (
-            "Очищает локальный кэш сообщений этого чата. Кэш используется для save/edit-"
-            "отчётов (чтобы показать текст удалённого или изменённого сообщения) — "
-            "<code>.clean</code> стирает эту историю, если она больше не нужна."
-        ),
-        "subs": [],
-    },
-    {
         "key": "anim",
         "button": "⌨️ .anim",
         "title": "⌨️ .anim текст",
@@ -336,17 +307,22 @@ HELP_ITEMS = [
         ],
     },
     {
-        "key": "ping",
-        "button": "🏓 .ping",
-        "title": "🏓 .ping",
-        "desc": "Проверка, что бот жив и отвечает — присылает «pong» в личку владельцу.",
-        "subs": [],
-    },
-    {
         "key": "help",
         "button": "❓ .help",
         "title": "❓ .help",
         "desc": "Присылает список всех команд одним сообщением прямо в чат с собеседником.",
+        "subs": [],
+    },
+    {
+        "key": "muted_direct",
+        "button": "📋 /muted",
+        "title": "📋 /muted",
+        "desc": (
+            "Это единственная команда без точки — пишется не в чате с собеседником, а прямо "
+            "сюда, в этот чат с ботом. Показывает список всех замьюченных чатов по всем твоим "
+            "подключённым Business-аккаунтам: с юзернеймом/именем и оставшимся временем "
+            "(или пометкой «навсегда»)."
+        ),
         "subs": [],
     },
 ]
@@ -367,10 +343,10 @@ def _find_sub(cmd_key: str, sub_key: str) -> dict | None:
 def build_help_root_text() -> str:
     return (
         "<b>LimeEye — команды</b>\n\n"
-        "Ниже список всех команд бота. Нажми на любую, чтобы посмотреть подробное "
-        "описание (а если у команды есть варианты использования — они тоже будут "
-        "отдельными кнопками).\n\n"
-        "Все команды пишутся прямо в чате с собеседником (не сюда, боту), с префиксом «.»."
+        "Ниже список команд, которые пишутся прямо в чате с собеседником (с префиксом «.»). "
+        "Нажми на любую, чтобы посмотреть подробное описание (а если у команды есть варианты "
+        "использования — они тоже будут отдельными кнопками).\n\n"
+        "Список замьюченных чатов смотри отдельно командой /muted прямо здесь, в чате с ботом."
     )
 
 
