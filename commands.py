@@ -5,7 +5,7 @@ import time
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from utils import parse_duration, human_duration, chat_info, sender_info, html_escape
+from utils import parse_duration, human_duration, chat_info, sender_info, html_escape, media_file, media_label
 from tictactoe import new_board, render_text, render_keyboard
 
 log = logging.getLogger("LimeEye")
@@ -18,6 +18,11 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.unmute</code> — снять мьют с этого чата.
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
+<code>.save</code> — ответом на сообщение с медиа: пересылает файл (фото/видео/
+   голосовое/кружок/файл/GIF/аудио) тебе в личку с ботом. Пиши сразу, пока
+   сообщение ещё видно в чате — особенно для одноразовых/самоуничтожающихся
+   фото и видео (бот не умеет отличать их от обычных, поэтому не тянет их
+   автоматически — это надо запросить самому командой).
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
    Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
@@ -26,10 +31,6 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 Список замьюченных чатов смотри командой /muted прямо в чате с ботом (не здесь).
 Кэш сообщений (для save/edit-отчётов) очищается автоматически сам через
 несколько дней — вручную чистить не нужно.
-
-💾 Если ответить любым текстом на сообщение с медиа (фото/видео/голосовое/
-кружок), бот пришлёт этот файл тебе в личку — работает и для одноразовых
-(самоуничтожающихся) фото/видео, пока они ещё не пропали из чата.
 
 Учти: для <code>.mute</code> и очистки самой команды из чата нужно, чтобы при
 подключении бота в Settings → Telegram Business → Chatbots было включено
@@ -172,6 +173,60 @@ async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str
     return f"📨 Отправлено {sent_count} сообщений."
 
 
+# Соответствие "kind" из media_file() методу отправки в aiogram Bot
+_SEND_METHOD_BY_KIND = {
+    "photo": "send_photo",
+    "video": "send_video",
+    "voice": "send_voice",
+    "video_note": "send_video_note",
+    "document": "send_document",
+    "animation": "send_animation",
+    "audio": "send_audio",
+}
+
+
+async def cmd_save(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    """
+    .save — команда пишется ОТВЕТОМ на сообщение с медиа. Пересылает файл
+    (фото/видео/голосовое/кружок/файл/GIF/аудио) себе в личку с ботом.
+
+    Важно: Telegram Bot API не сообщает боту, является ли фото/видео
+    "одноразовым" (самоуничтожающимся) — это MTProto-уровневая метка,
+    недоступная ботам с токеном. Поэтому автоматически различать обычное и
+    одноразовое медиа технически невозможно: .save — это осознанное действие,
+    которое нужно вызвать самому, пока сообщение ещё видно в чате (не после
+    того, как оно уже пропало).
+    """
+    if bot is None or message is None:
+        return "⚠️ Команда недоступна."
+
+    replied = message.reply_to_message
+    if not replied:
+        return "⚠️ Команду нужно отправлять ответом на сообщение с медиа: ответь на фото/видео и напиши .save"
+
+    kind, file_id = media_file(replied)
+    if not kind:
+        return "⚠️ В сообщении, на которое ты ответил, нет медиа, которое можно сохранить."
+
+    conn = await storage.get_connection(bc_id)
+    if not conn:
+        return "⚠️ Не найдено подключение — не знаю, куда прислать файл."
+
+    send_method_name = _SEND_METHOD_BY_KIND.get(kind)
+    method = getattr(bot, send_method_name, None) if send_method_name else None
+    if method is None:
+        return "⚠️ Этот тип медиа пока не поддерживается для сохранения."
+
+    try:
+        await method(chat_id=conn["owner_chat_id"], **{kind: file_id})
+    except TelegramAPIError:
+        log.exception("Не удалось переслать медиа через .save (bc=%s, chat=%s)", bc_id, chat_id)
+        return "⚠️ Не удалось переслать файл (возможно, он уже недоступен — смотри логи)."
+
+    label = media_label(replied) or "Медиа"
+    return f"💾 {label} сохранено выше."
+
+
 async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     if bot is None or message is None:
         return "⚠️ Игра недоступна (нет доступа к боту)."
@@ -263,6 +318,7 @@ COMMANDS = {
     "unmute": cmd_unmute,
     "anim": cmd_anim,
     "spam": cmd_spam,
+    "save": cmd_save,
     "tic": cmd_tic,
     "help": cmd_help,
 }
@@ -355,6 +411,31 @@ HELP_ITEMS = [
                     "защита от случайного флуда/бана аккаунта. Если нужно больше — "
                     "вызови команду ещё раз."
                 ),
+            },
+        ],
+    },
+    {
+        "key": "save",
+        "button": "💾 .save",
+        "title": "💾 .save",
+        "desc": (
+            "Пишется ОТВЕТОМ на сообщение с медиа — пересылает файл (фото/видео/голосовое/"
+            "кружок/файл/GIF/аудио) тебе в личку с ботом.\n\n"
+            "Для одноразовых (самоуничтожающихся) фото и видео это единственный рабочий "
+            "способ сохранить их: Telegram Bot API не сообщает боту, какое медиа "
+            "одноразовое, а какое обычное (это MTProto-уровневая метка, недоступная ботам "
+            "с токеном) — поэтому бот не тянет файлы автоматически.\n\n"
+            "Пока сообщение ещё видно в чате — даже если собеседник уже открыл его и оно вот-"
+            "вот исчезнет с его стороны — успей ответить <code>.save</code>, и бот заберёт "
+            "файл, пока reply_to_message ещё содержит его данные. После того как сообщение "
+            "полностью пропадёт, спасти его уже не получится."
+        ),
+        "subs": [
+            {
+                "key": "usage",
+                "button": "Как использовать",
+                "title": ".save",
+                "desc": "Ответь на сообщение с фото/видео и напиши <code>.save</code> — файл придёт тебе в личку с ботом.",
             },
         ],
     },
