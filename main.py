@@ -5,10 +5,11 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import BotCommand
 
 from config import BOT_TOKEN, CMD_PREFIX
 from storage import Storage
-from commands import COMMANDS
+from commands import COMMANDS, cmd_muted
 from utils import truncate, media_label, sender_info, chat_info, quote_html, mention_html
 
 BOT_NAME = "LimeEye"
@@ -47,13 +48,28 @@ async def try_delete_business(business_connection_id: str, message_id: int) -> b
 # ---------------------------------------------------------------------------
 @dp.message()
 async def on_direct_message(message: types.Message):
-    if message.text and message.text.startswith("/start"):
+    if not message.text:
+        return
+
+    if message.text.startswith("/start"):
         await message.answer(
             f"👋 {BOT_NAME} запущен.\n\n"
             "Подключи меня к своему аккаунту: Настройки → Telegram Business → Чат-боты, "
             "выбери меня и включи право «Удаление сообщений», если хочешь пользоваться .mute.\n\n"
             "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же."
         )
+        return
+
+    if message.text.startswith("/muted"):
+        bc_ids = await storage.get_owner_connections(message.chat.id)
+        if not bc_ids:
+            await message.answer("Пока нет активных подключений Business-аккаунта.")
+            return
+        replies = []
+        for bc_id in bc_ids:
+            reply = await cmd_muted(None, "", storage, bc_id)
+            replies.append(reply)
+        await message.answer("\n\n".join(replies))
 
 
 # ---------------------------------------------------------------------------
@@ -115,11 +131,12 @@ async def on_business_message(message: types.Message):
             handler = COMMANDS.get(name)
             if handler:
                 try:
-                    reply = await handler(chat_id, args, storage, bc_id)
+                    reply = await handler(chat_id, args, storage, bc_id, message=message, bot=bot)
                 except Exception:
                     log.exception("Ошибка выполнения команды %s", name)
                     reply = f"⚠️ Ошибка при выполнении .{name}, смотри логи."
-                await notify_owner(conn["owner_chat_id"], reply)
+                if reply:  # .anim, например, ничего не шлёт владельцу отдельно
+                    await notify_owner(conn["owner_chat_id"], reply)
                 if conn["can_delete_all_messages"] or conn["can_delete_sent_messages"]:
                     await try_delete_business(bc_id, message.message_id)
                 return  # команду не кэшируем и не проверяем на мьют
@@ -219,6 +236,14 @@ async def main():
     await storage.init()
     me = await bot.get_me()
     log.info("%s запущен как @%s", BOT_NAME, me.username)
+
+    # Меню-кнопка "/" в личном чате с ботом (не в business-чатах — там команды
+    # через префикс CMD_PREFIX). /muted показывает список замьюченных чатов.
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Информация о боте"),
+        BotCommand(command="muted", description="Список замьюченных чатов"),
+    ])
+
     await dp.start_polling(bot)
 
 

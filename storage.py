@@ -36,9 +36,18 @@ CREATE TABLE IF NOT EXISTS muted_chats (
     chat_id INTEGER NOT NULL,
     until_ts INTEGER,   -- NULL = навсегда
     muted_at INTEGER,
+    chat_name TEXT,
+    chat_username TEXT,
     PRIMARY KEY (business_connection_id, chat_id)
 );
 """
+
+# Колонки, добавленные уже после первого релиза — накатываются на существующие
+# базы отдельно от CREATE TABLE (SQLite не умеет ALTER TABLE ... IF NOT EXISTS).
+MIGRATIONS = [
+    ("muted_chats", "chat_name", "TEXT"),
+    ("muted_chats", "chat_username", "TEXT"),
+]
 
 
 class Storage:
@@ -50,6 +59,15 @@ class Storage:
         self._db = await aiosqlite.connect(self.path)
         await self._db.executescript(SCHEMA)
         await self._db.commit()
+        await self._run_migrations()
+
+    async def _run_migrations(self):
+        for table, column, col_type in MIGRATIONS:
+            try:
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                await self._db.commit()
+            except aiosqlite.OperationalError:
+                pass  # колонка уже есть — база не первый раз запускается
 
     async def close(self):
         if self._db:
@@ -163,14 +181,17 @@ class Storage:
 
     # ---------- замьюченные чаты ----------
 
-    async def mute_chat(self, business_connection_id, chat_id, duration_seconds: int | None):
+    async def mute_chat(self, business_connection_id, chat_id, duration_seconds: int | None,
+                         chat_name: str | None = None, chat_username: str | None = None):
         until_ts = int(time.time()) + duration_seconds if duration_seconds else None
         await self._db.execute(
-            """INSERT INTO muted_chats (business_connection_id, chat_id, until_ts, muted_at)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO muted_chats
+               (business_connection_id, chat_id, until_ts, muted_at, chat_name, chat_username)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
-                 until_ts=excluded.until_ts, muted_at=excluded.muted_at""",
-            (business_connection_id, chat_id, until_ts, int(time.time())),
+                 until_ts=excluded.until_ts, muted_at=excluded.muted_at,
+                 chat_name=excluded.chat_name, chat_username=excluded.chat_username""",
+            (business_connection_id, chat_id, until_ts, int(time.time()), chat_name, chat_username),
         )
         await self._db.commit()
 
@@ -197,7 +218,20 @@ class Storage:
 
     async def list_muted(self, business_connection_id):
         cur = await self._db.execute(
-            "SELECT chat_id, until_ts FROM muted_chats WHERE business_connection_id = ?",
+            "SELECT chat_id, until_ts, chat_name, chat_username "
+            "FROM muted_chats WHERE business_connection_id = ?",
             (business_connection_id,),
         )
         return await cur.fetchall()
+
+    # ---------- поиск подключений владельца (для команд в личке с ботом) ----------
+
+    async def get_owner_connections(self, owner_chat_id):
+        """Все business-подключения, репорты которых приходят в этот личный чат с ботом."""
+        cur = await self._db.execute(
+            "SELECT business_connection_id FROM connections "
+            "WHERE owner_chat_id = ? AND is_enabled = 1",
+            (owner_chat_id,),
+        )
+        rows = await cur.fetchall()
+        return [row[0] for row in rows]
