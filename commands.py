@@ -146,28 +146,36 @@ async def cmd_save(chat_id, args, storage, bc_id, message=None, bot=None) -> str
 
     media_id = None
     media_type = None
+    filename = "file"
 
     if reply.photo:
         media_id = reply.photo[-1].file_id
         media_type = "photo"
+        filename = "photo.jpg"
     elif reply.video:
         media_id = reply.video.file_id
         media_type = "video"
+        filename = "video.mp4"
     elif reply.voice:
         media_id = reply.voice.file_id
         media_type = "voice"
+        filename = "voice.ogg"
     elif reply.video_note:
         media_id = reply.video_note.file_id
         media_type = "video_note"
+        filename = "video_note.mp4"
     elif reply.animation:
         media_id = reply.animation.file_id
         media_type = "animation"
+        filename = "animation.mp4"
     elif reply.document:
         media_id = reply.document.file_id
         media_type = "document"
+        filename = reply.document.file_name or "document"
     elif reply.audio:
         media_id = reply.audio.file_id
         media_type = "audio"
+        filename = reply.audio.file_name or "audio.mp3"
     else:
         return "⚠️ В отвеченном сообщении нет поддерживаемого медиа."
 
@@ -177,17 +185,25 @@ async def cmd_save(chat_id, args, storage, bc_id, message=None, bot=None) -> str
         return "⚠️ Ошибка отправки: неподдерживаемый тип медиа."
 
     try:
+        # Скачиваем файл в буфер для обхода блокировок одноразовых медиа
+        file_buffer = BytesIO()
+        await bot.download(media_id, destination=file_buffer)
+        file_buffer.seek(0)
+        
+        input_file = BufferedInputFile(file_buffer.getvalue(), filename=filename)
+        
         kwargs = {
             "chat_id": owner_chat,
-            media_type: media_id,
+            media_type: input_file,
             "caption": "📸 <b>Сохранённое медиа</b>"
         }
         if reply.caption:
             kwargs["caption"] += f"\n\nПодпись: {html_escape(reply.caption)}"
+            
         await method(**kwargs)
     except TelegramAPIError:
         log.exception("Не удалось сохранить медиа из чата %s (bc=%s)", chat_id, bc_id)
-        return "⚠️ Не удалось сохранить медиа (возможно, оно уже недоступно)."
+        return "⚠️ Не удалось сохранить медиа (возможно, срок действия файла истёк)."
 
     return None
 
@@ -800,7 +816,7 @@ HELP_ITEMS = [
         "button": "💾 .save",
         "title": "💾 .save",
         "desc": (
-            "Сохраняет медиа (фото, видео, голосовые и т.д.) из сообщения, "
+            "Сохраняет медиа (фото, video, голосовые и т.д.) из сообщения, "
             "на которое ты ответил этой командой. "
             "Полезно для сохранения исчезающих фото или видео. "
             "Файл будет отправлен тебе в личку с ботом."
@@ -928,7 +944,7 @@ HELP_ITEMS = [
         "desc": (
             "Камень-ножницы-бумага с собеседником прямо в чате: под сообщением появляются "
             "три кнопки. Оба выбирают втайне друг от друга — выбор виден только тебе самому "
-            "(всплывающей подсказкой), пока не выберут оба. Как только оба готовы, бот "
+            "(всплывающей подсказкой), пока не выберут оба. Как select оба готовы, бот "
             "раскрывает оба варианта и результат. После раунда появится кнопка "
             "«🔄 Играть снова»."
         ),
