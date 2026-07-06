@@ -88,6 +88,12 @@ CREATE TABLE IF NOT EXISTS hangman_games (
     updated_at INTEGER,
     PRIMARY KEY (business_connection_id, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS pending_hangman_words (
+    owner_chat_id INTEGER PRIMARY KEY,   -- личный чат бота с владельцем, который загадал слово
+    word TEXT NOT NULL,
+    created_at INTEGER
+);
 """
 
 # Колонки, добавленные уже после первого релиза — накатываются на существующие
@@ -492,3 +498,33 @@ class Storage:
             (business_connection_id, chat_id),
         )
         await self._db.commit()
+
+    # ---------- pending_hangman_words (слово, загаданное владельцем в лс с ботом) ----------
+
+    async def set_pending_hangman_word(self, owner_chat_id, word):
+        await self._db.execute(
+            """INSERT INTO pending_hangman_words (owner_chat_id, word, created_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(owner_chat_id) DO UPDATE SET
+                   word=excluded.word, created_at=excluded.created_at""",
+            (owner_chat_id, word, int(time.time())),
+        )
+        await self._db.commit()
+
+    async def get_pending_hangman_word(self, owner_chat_id):
+        cur = await self._db.execute(
+            "SELECT word FROM pending_hangman_words WHERE owner_chat_id = ?",
+            (owner_chat_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def pop_pending_hangman_word(self, owner_chat_id):
+        word = await self.get_pending_hangman_word(owner_chat_id)
+        if word is not None:
+            await self._db.execute(
+                "DELETE FROM pending_hangman_words WHERE owner_chat_id = ?",
+                (owner_chat_id,),
+            )
+            await self._db.commit()
+        return word

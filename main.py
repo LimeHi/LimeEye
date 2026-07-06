@@ -189,6 +189,42 @@ async def on_direct_message(message: types.Message):
             reply = await cmd_muted(None, "", storage, bc_id)
             replies.append(reply)
         await message.answer("\n\n".join(replies))
+        return
+
+    if message.text.startswith("/hangman"):
+        bc_ids = await storage.get_owner_connections(message.chat.id)
+        if not bc_ids:
+            await message.answer("Пока нет активных подключений Business-аккаунта.")
+            return
+
+        raw = message.text[len("/hangman"):].strip()
+        if not raw:
+            pending = await storage.get_pending_hangman_word(message.chat.id)
+            if pending:
+                await message.answer(
+                    f"🪢 Уже загадано слово из {len(pending)} букв — оно будет использовано "
+                    "в следующей игре <code>.hangman</code>.\n"
+                    "Чтобы загадать другое слово вместо него, напиши: <code>/hangman слово</code>"
+                )
+            else:
+                await message.answer(
+                    "🪢 Напиши слово вот так: <code>/hangman слово</code> — оно будет "
+                    "использовано в следующей игре <code>.hangman</code> в любом чате "
+                    "(одноразово, отгадывать будет собеседник, не ты)."
+                )
+            return
+
+        word, error = hangman_engine.validate_custom_word(raw)
+        if error:
+            await message.answer(error)
+            return
+
+        await storage.set_pending_hangman_word(message.chat.id, word)
+        await message.answer(
+            f"🪢 Слово из {len(word)} букв загадано и ждёт своей игры.\n"
+            "Напиши <code>.hangman</code> в чате с собеседником, чтобы начать."
+        )
+        return
 
 
 @dp.business_connection()
@@ -606,7 +642,11 @@ async def on_hangman_callback(callback: types.CallbackQuery):
             await callback.answer("Игра ещё не закончена.", show_alert=True)
             return
 
-        word = hangman_engine.new_word()
+        conn = await storage.get_connection(bc_id)
+        owner_chat_id = conn["owner_chat_id"] if conn else None
+        word = await storage.pop_pending_hangman_word(owner_chat_id) if owner_chat_id else None
+        if not word:
+            word = hangman_engine.new_word()
         await storage.start_hangman_game(
             bc_id, chat_id, word,
             game["x_user_id"], game["x_name"], game["o_user_id"], game["o_name"],
@@ -626,6 +666,10 @@ async def on_hangman_callback(callback: types.CallbackQuery):
 
     if game["status"] != "playing":
         await callback.answer("Игра уже завершена — нажми «Играть снова».", show_alert=True)
+        return
+
+    if user_id == game["x_user_id"]:
+        await callback.answer("Ты загадал(а) слово — отгадывает собеседник.", show_alert=True)
         return
 
     if game.get("message_id") and message.message_id != game["message_id"]:
@@ -703,6 +747,7 @@ async def main():
         BotCommand(command="start", description="Информация о боте"),
         BotCommand(command="help", description="Все команды бота (для чатов с собеседниками)"),
         BotCommand(command="muted", description="Список замьюченных чатов"),
+        BotCommand(command="hangman", description="Загадать слово для .hangman"),
     ])
 
     bg_task = asyncio.create_task(cache_purge_loop())
