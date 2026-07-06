@@ -12,6 +12,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedIn
 
 from utils import parse_duration, human_duration, chat_info, sender_info, html_escape
 from tictactoe import new_board, render_text, render_keyboard
+import rps as rps_engine
 
 log = logging.getLogger("LimeEye")
 
@@ -29,6 +30,9 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.export</code> — выгрузить всю кэшированную переписку этого чата в .txt-файл себе в личку.
 <code>.currency СУММА ИЗ В</code> — конвертер валют (курс ЕЦБ), ответ приходит сюда.
    Пример: <code>.currency 100 USD RUB</code>
+<code>.rps</code> — камень-ножницы-бумага с собеседником прямо в чате (кнопки под сообщением).
+   Оба выбирают втайне, потом бот раскрывает результат.
+<code>.rps stop</code> — досрочно завершить текущий раунд в этом чате.
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
    Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
@@ -425,6 +429,81 @@ async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) ->
     )
 
 
+async def cmd_rps(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
+    if bot is None or message is None:
+        return "⚠️ Игра недоступна (нет доступа к боту)."
+
+    arg = (args or "").strip().lower()
+    if arg in ("stop", "cancel", "стоп"):
+        existing = await storage.get_rps_game(bc_id, chat_id)
+        if not existing:
+            return "Игра в этом чате не запущена."
+        await storage.delete_rps_game(bc_id, chat_id)
+
+        outcome = "не найдено (уже удалено?)"
+        if existing.get("message_id"):
+            try:
+                await bot.delete_business_messages(
+                    business_connection_id=bc_id,
+                    message_ids=[existing["message_id"]],
+                )
+                outcome = "сообщение с игрой удалено из чата"
+            except TelegramAPIError:
+                log.info(
+                    "Не удалось удалить .rps-сообщение %s в чате %s (нет прав?), "
+                    "обновляю текст вместо удаления", existing["message_id"], chat_id,
+                )
+                try:
+                    stopped_text = (
+                        "🪨📄✂️ <b>Камень-ножницы-бумага</b>\n"
+                        f"🅧 {html_escape(existing['x_name'])}  vs  🅞 {html_escape(existing['o_name'])}\n\n"
+                        "⏹ Игра остановлена."
+                    )
+                    await bot.edit_message_text(
+                        business_connection_id=bc_id,
+                        chat_id=chat_id,
+                        message_id=existing["message_id"],
+                        text=stopped_text,
+                        reply_markup=None,
+                    )
+                    outcome = "нет права на удаление — заменил текст на «игра остановлена»"
+                except TelegramAPIError:
+                    log.exception(
+                        "Не удалось обновить .rps-сообщение %s в чате %s после stop",
+                        existing["message_id"], chat_id,
+                    )
+                    outcome = "не удалось ни удалить, ни обновить сообщение (смотри логи)"
+
+        return f"⏹ Игра остановлена ({outcome})."
+
+    x_name = sender_info(message)["name"]
+    o_name = chat_info(message)["name"]
+    text = rps_engine.render_text(x_name, o_name, None, None, finished=False)
+    keyboard = rps_engine.render_keyboard(finished=False)
+
+    try:
+        sent = await bot.send_message(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        log.exception("Не удалось отправить игровое поле .rps в чат %s (bc=%s)", chat_id, bc_id)
+        return "⚠️ Не удалось начать игру (смотри логи)."
+
+    await storage.start_rps_game(
+        business_connection_id=bc_id,
+        chat_id=chat_id,
+        x_user_id=message.from_user.id,
+        x_name=x_name,
+        o_user_id=chat_id,
+        o_name=o_name,
+        message_id=sent.message_id,
+    )
+    return None
+
+
 async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     if bot is None or message is None:
         return "⚠️ Игра недоступна (нет доступа к боту)."
@@ -520,6 +599,7 @@ COMMANDS = {
     "short": cmd_short,
     "export": cmd_export,
     "currency": cmd_currency,
+    "rps": cmd_rps,
     "tic": cmd_tic,
     "help": cmd_help,
 }
@@ -681,6 +761,30 @@ HELP_ITEMS = [
                 "button": "Пример использования",
                 "title": ".currency СУММА ИЗ В",
                 "desc": "<code>.currency 100 USD RUB</code>\n<code>.currency 50 EUR USD</code>",
+            },
+        ],
+    },
+    {
+        "key": "rps",
+        "button": "🪨 .rps",
+        "title": "🪨📄✂️ .rps",
+        "desc": (
+            "Камень-ножницы-бумага с собеседником прямо в чате: под сообщением появляются "
+            "три кнопки. Оба выбирают втайне друг от друга — выбор виден только тебе самому "
+            "(всплывающей подсказкой), пока не выберут оба. Как только оба готовы, бот "
+            "раскрывает оба варианта и результат. После раунда появится кнопка "
+            "«🔄 Играть снова»."
+        ),
+        "subs": [
+            {
+                "key": "stop",
+                "button": ".rps stop — остановить раунд",
+                "title": ".rps stop",
+                "desc": (
+                    "Досрочно завершает текущий раунд в этом чате: убирает сообщение с игрой "
+                    "(или, если прав на удаление нет, помечает его как остановленное) — после "
+                    "этого можно начать заново командой <code>.rps</code>."
+                ),
             },
         ],
     },

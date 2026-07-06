@@ -57,6 +57,21 @@ CREATE TABLE IF NOT EXISTS tic_games (
     updated_at INTEGER,
     PRIMARY KEY (business_connection_id, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS rps_games (
+    business_connection_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER,
+    status TEXT NOT NULL,       -- 'playing' | 'finished'
+    x_user_id INTEGER,
+    x_name TEXT,
+    x_choice TEXT,              -- 'rock' | 'paper' | 'scissors' | NULL
+    o_user_id INTEGER,
+    o_name TEXT,
+    o_choice TEXT,
+    updated_at INTEGER,
+    PRIMARY KEY (business_connection_id, chat_id)
+);
 """
 
 # Колонки, добавленные уже после первого релиза — накатываются на существующие
@@ -343,6 +358,72 @@ class Storage:
     async def delete_game(self, business_connection_id, chat_id):
         await self._db.execute(
             "DELETE FROM tic_games WHERE business_connection_id = ? AND chat_id = ?",
+            (business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    # ---------- rps_games (камень-ножницы-бумага) ----------
+
+    async def start_rps_game(self, business_connection_id, chat_id, x_user_id, x_name,
+                              o_user_id, o_name, message_id):
+        await self._db.execute(
+            """INSERT INTO rps_games
+               (business_connection_id, chat_id, message_id, status,
+                x_user_id, x_name, x_choice, o_user_id, o_name, o_choice, updated_at)
+               VALUES (?, ?, ?, 'playing', ?, ?, NULL, ?, ?, NULL, ?)
+               ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
+                   message_id=excluded.message_id, status='playing',
+                   x_user_id=excluded.x_user_id, x_name=excluded.x_name, x_choice=NULL,
+                   o_user_id=excluded.o_user_id, o_name=excluded.o_name, o_choice=NULL,
+                   updated_at=excluded.updated_at""",
+            (business_connection_id, chat_id, message_id, x_user_id, x_name,
+             o_user_id, o_name, int(time.time())),
+        )
+        await self._db.commit()
+
+    async def get_rps_game(self, business_connection_id, chat_id):
+        cur = await self._db.execute(
+            "SELECT business_connection_id, chat_id, message_id, status, "
+            "x_user_id, x_name, x_choice, o_user_id, o_name, o_choice "
+            "FROM rps_games WHERE business_connection_id = ? AND chat_id = ?",
+            (business_connection_id, chat_id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        keys = ["business_connection_id", "chat_id", "message_id", "status",
+                "x_user_id", "x_name", "x_choice", "o_user_id", "o_name", "o_choice"]
+        return dict(zip(keys, row))
+
+    async def set_rps_choice(self, business_connection_id, chat_id, side, choice):
+        """side — 'x_choice' или 'o_choice'."""
+        assert side in ("x_choice", "o_choice")
+        await self._db.execute(
+            f"UPDATE rps_games SET {side} = ?, updated_at = ? "
+            "WHERE business_connection_id = ? AND chat_id = ?",
+            (choice, int(time.time()), business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    async def finish_rps_game(self, business_connection_id, chat_id):
+        await self._db.execute(
+            "UPDATE rps_games SET status = 'finished', updated_at = ? "
+            "WHERE business_connection_id = ? AND chat_id = ?",
+            (int(time.time()), business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    async def reset_rps_game(self, business_connection_id, chat_id):
+        await self._db.execute(
+            "UPDATE rps_games SET status = 'playing', x_choice = NULL, o_choice = NULL, "
+            "updated_at = ? WHERE business_connection_id = ? AND chat_id = ?",
+            (int(time.time()), business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    async def delete_rps_game(self, business_connection_id, chat_id):
+        await self._db.execute(
+            "DELETE FROM rps_games WHERE business_connection_id = ? AND chat_id = ?",
             (business_connection_id, chat_id),
         )
         await self._db.commit()

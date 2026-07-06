@@ -17,6 +17,7 @@ from commands import (
 )
 from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html
 from tictactoe import EMPTY, new_board, apply_move, check_result, other_mark, render_text, render_keyboard
+import rps as rps_engine
 
 BOT_NAME = "LimeEye"
 
@@ -414,6 +415,94 @@ async def on_tic_callback(callback: types.CallbackQuery):
     except TelegramAPIError:
         log.exception("Не удалось обновить доску игры в чате %s", chat_id)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("rps:"))
+async def on_rps_callback(callback: types.CallbackQuery):
+    data = callback.data
+    message = callback.message
+    bc_id = getattr(message, "business_connection_id", None) if message else None
+
+    if message is None or not bc_id:
+        await callback.answer()
+        return
+
+    chat_id = message.chat.id
+    game = await storage.get_rps_game(bc_id, chat_id)
+    if not game:
+        await callback.answer("Игра не найдена или уже завершена.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+
+    # --- перезапуск после завершённой игры ---
+    if data == "rps:restart":
+        if game["status"] != "finished":
+            await callback.answer("Игра ещё не закончена.", show_alert=True)
+            return
+        if user_id not in (game["x_user_id"], game["o_user_id"]):
+            await callback.answer("Ты не участвуешь в этой игре.", show_alert=True)
+            return
+
+        await storage.reset_rps_game(bc_id, chat_id)
+        text = rps_engine.render_text(game["x_name"], game["o_name"], None, None, finished=False)
+        keyboard = rps_engine.render_keyboard(finished=False)
+        try:
+            await bot.edit_message_text(
+                business_connection_id=bc_id, chat_id=chat_id,
+                message_id=message.message_id, text=text, reply_markup=keyboard,
+            )
+        except TelegramAPIError:
+            log.exception("Не удалось перезапустить .rps в чате %s", chat_id)
+        await callback.answer("Новый раунд!")
+        return
+
+    if game["status"] == "finished":
+        await callback.answer("Раунд уже завершён — нажми «Играть снова».", show_alert=True)
+        return
+
+    if game.get("message_id") and message.message_id != game["message_id"]:
+        await callback.answer("Это старая игра, начни новую через .rps", show_alert=True)
+        return
+
+    if user_id not in (game["x_user_id"], game["o_user_id"]):
+        await callback.answer("Ты не участвуешь в этой игре.", show_alert=True)
+        return
+
+    try:
+        choice = data.split(":", 2)[2]
+    except IndexError:
+        await callback.answer()
+        return
+    if choice not in rps_engine.CHOICES:
+        await callback.answer()
+        return
+
+    side = "x_choice" if user_id == game["x_user_id"] else "o_choice"
+    if game[side]:
+        await callback.answer(f"Ты уже выбрал: {rps_engine.CHOICES[game[side]]}", show_alert=True)
+        return
+
+    await storage.set_rps_choice(bc_id, chat_id, side, choice)
+    game[side] = choice  # обновляем локальную копию, чтобы не перезапрашивать БД
+
+    both_ready = bool(game["x_choice"] and game["o_choice"])
+    if both_ready:
+        await storage.finish_rps_game(bc_id, chat_id)
+    text = rps_engine.render_text(
+        game["x_name"], game["o_name"], game["x_choice"], game["o_choice"], finished=both_ready,
+    )
+    keyboard = rps_engine.render_keyboard(finished=both_ready)
+
+    try:
+        await bot.edit_message_text(
+            business_connection_id=bc_id, chat_id=chat_id,
+            message_id=message.message_id, text=text, reply_markup=keyboard,
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось обновить .rps в чате %s", chat_id)
+
+    await callback.answer(f"Твой выбор: {rps_engine.CHOICES[choice]}")
 
 
 CACHE_PURGE_INTERVAL_SECONDS = 6 * 3600  # проверяем раз в 6 часов
