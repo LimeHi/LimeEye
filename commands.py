@@ -28,11 +28,11 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.save</code> — сохранить исчезающее фото/медиа (нужно ответить на сообщение).
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
-<code>.cal выражение</code> — калькулятор, ответ приходит сюда, в чат с ботом.
+<code>.cal выражение</code> — калькулятор, ответ приходит прямо в этот чат.
    Пример: <code>.cal (2 + 3) * 4 / 7</code>, <code>.cal sqrt(2) + pi</code>
-<code>.short ссылка</code> — сократить длинную ссылку, ответ приходит сюда.
+<code>.short ссылка</code> — сократить длинную ссылку, ответ приходит прямо в этот чат.
 <code>.export</code> — выгрузить всю кэшированную переписку этого чата в .txt-файл себе в личку.
-<code>.currency СУММА ИЗ В</code> — конвертер валют (курс на сегодня), ответ приходит сюда.
+<code>.currency СУММА ИЗ В</code> — конвертер валют (курс на сегодня), ответ приходит прямо в этот чат.
    Пример: <code>.currency 100 USD RUB</code>
 <code>.rps</code> — камень-ножницы-бумага с собеседником прямо в чате (кнопки под сообщением).
    Оба выбирают втайне, потом бот раскрывает результат.
@@ -50,7 +50,7 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 несколько дней — вручную чистить не нужно.
 
 Учти: для <code>.mute</code> и очистки самой команды из чата нужно, чтобы при
-подключении бота в Settings → Telegram Business → Chatbots было включено
+подключении бота в Settings → Автоматизация чатов было включено
 право «Delete messages» (можно удалять чужие сообщения).
 """
 
@@ -383,7 +383,20 @@ def _cal_format(value) -> str:
     return str(value)
 
 
-async def cmd_cal(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+async def _send_result_to_chat(bot, bc_id, chat_id, text: str, error_prefix: str) -> str | None:
+    """Отправляет готовый ответ прямо в чат с собеседником (а не владельцу в личку).
+    Возвращает None при успехе, либо текст ошибки (уйдёт владельцу в личку через notify_owner)."""
+    if bot is None:
+        return "⚠️ Команда недоступна (нет доступа к боту)."
+    try:
+        await bot.send_message(business_connection_id=bc_id, chat_id=chat_id, text=text)
+    except TelegramAPIError:
+        log.exception("%s: не удалось отправить результат в чат %s (bc=%s)", error_prefix, chat_id, bc_id)
+        return "⚠️ Не удалось отправить результат в чат (смотри логи)."
+    return None
+
+
+async def cmd_cal(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     expr = (args or "").strip()
     if not expr:
         return (
@@ -401,7 +414,8 @@ async def cmd_cal(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
         log.exception(".cal: не удалось посчитать выражение %r", expr)
         return "⚠️ Не удалось посчитать (проверь выражение)."
 
-    return f"🧮 <code>{html_escape(expr)}</code> = <b>{html_escape(_cal_format(result))}</b>"
+    text = f"🧮 <code>{html_escape(expr)}</code> = <b>{html_escape(_cal_format(result))}</b>"
+    return await _send_result_to_chat(bot, bc_id, chat_id, text, ".cal")
 
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
@@ -452,7 +466,7 @@ async def _shorten_tinyurl(session: aiohttp.ClientSession, url: str) -> str | No
     return text
 
 
-async def cmd_short(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+async def cmd_short(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     url = (args or "").strip()
     if not url:
         return "⚠️ Формат: <code>.short ссылка</code>\nПример: <code>.short https://example.com/очень/длинная/ссылка</code>"
@@ -467,7 +481,8 @@ async def cmd_short(chat_id, args, storage, bc_id, message=None, bot=None) -> st
     if not short:
         return "⚠️ Не удалось сократить ссылку (оба сервиса недоступны, смотри логи)."
 
-    return f"🔗 {html_escape(short)}"
+    text = f"🔗 {html_escape(short)}"
+    return await _send_result_to_chat(bot, bc_id, chat_id, text, ".short")
 
 
 async def cmd_export(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
@@ -507,7 +522,7 @@ async def cmd_export(chat_id, args, storage, bc_id, message=None, bot=None) -> s
     return None
 
 
-async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     parts = (args or "").strip().split()
     if len(parts) != 3:
         return (
@@ -552,10 +567,11 @@ async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) ->
     converted = amount * rates[to_code]
     rate_date = data.get("time_last_update_utc", "")
 
-    return (
+    text = (
         f"💱 {amount:g} {from_code} = <b>{converted:,.2f} {to_code}</b>\n"
         f"<i>курс на {html_escape(rate_date)}</i>"
     )
+    return await _send_result_to_chat(bot, bc_id, chat_id, text, ".currency")
 
 
 async def cmd_rps(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
@@ -918,8 +934,7 @@ HELP_ITEMS = [
         "button": "🧮 .cal",
         "title": "🧮 .cal выражение",
         "desc": (
-            "Калькулятор. Считает выражение и присылает ответ сюда, в чат с ботом "
-            "(не в бизнес-чат — переписку с собеседником он не засоряет).\n\n"
+            "Калькулятор. Считает выражение и присылает ответ прямо в этот чат.\n\n"
             "Поддерживает: <code>+ - * / // % **</code>, скобки, и функции "
             "<code>sqrt, abs, round, sin, cos, tan, log, log10, log2, exp, floor, ceil, "
             "factorial, min, max</code>, а также константы <code>pi</code> и <code>e</code>."
@@ -941,7 +956,7 @@ HELP_ITEMS = [
         "key": "short",
         "button": "🔗 .short",
         "title": "🔗 .short ссылка",
-        "desc": "Сокращает длинную ссылку (is.gd, а если он недоступен — TinyURL). Ответ (короткая ссылка) приходит сюда, в чат с ботом.",
+        "desc": "Сокращает длинную ссылку (is.gd, а если он недоступен — TinyURL). Ответ (короткая ссылка) приходит прямо в этот чат.",
         "subs": [
             {
                 "key": "usage",
@@ -970,7 +985,7 @@ HELP_ITEMS = [
         "title": "💱 .currency СУММА ИЗ В",
         "desc": (
             "Конвертер валют (без ключей и лимитов), поддерживает ~160 валют, включая RUB. "
-            "Ответ приходит сюда, в чат с ботом.\n\n"
+            "Ответ приходит прямо в этот чат.\n\n"
             "Коды валют — трёхбуквенные (ISO 4217): USD, EUR, RUB, GBP и т.д."
         ),
         "subs": [
