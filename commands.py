@@ -18,6 +18,22 @@ import hangman as hangman_engine
 
 log = logging.getLogger("LimeEye")
 
+
+def _is_business_peer_invalid(exc: Exception) -> bool:
+    """True, если Telegram отклонил отправку через business_connection_id
+    из-за настроек доступа бизнес-бота к этому конкретному чату
+    (Настройки → Telegram Business → Чат-боты → «Какие чаты доступны»)."""
+    return "BUSINESS_PEER_INVALID" in str(exc)
+
+
+_BUSINESS_PEER_INVALID_HINT = (
+    "⚠️ Telegram не даёт боту писать в этот чат через бизнес-подключение "
+    "(BUSINESS_PEER_INVALID).\n"
+    "Проверь в Telegram: Настройки → Telegram Business → Чат-боты → «Какие чаты "
+    "доступны» — этот чат, похоже, не входит в разрешённый список (например, "
+    "включено «только новые чаты», а это старый диалог, либо чат в исключениях)."
+)
+
 HELP_TEXT = """<b>LimeEye — команды</b>
 Пишутся прямо в чате с собеседником (не боту), с префиксом «.».
 
@@ -124,8 +140,10 @@ async def cmd_nomute(chat_id, args, storage, bc_id, message=None, bot=None) -> s
             text=text,
             parse_mode=None,
         )
-    except TelegramAPIError:
+    except TelegramAPIError as e:
         log.exception("Ошибка .nomute в чате %s (bc=%s)", chat_id, bc_id)
+        if _is_business_peer_invalid(e):
+            return _BUSINESS_PEER_INVALID_HINT
         return "⚠️ Не удалось отправить сообщение (смотри логи)."
 
     return None
@@ -160,7 +178,13 @@ async def cmd_anim(chat_id, args, storage, bc_id, message=None, bot=None) -> str
                 message_id=sent.message_id,
                 text=shown,
             )
+    except TelegramAPIError as e:
+        log.exception("Ошибка .anim в чате %s (bc=%s)", chat_id, bc_id)
+        if _is_business_peer_invalid(e):
+            return _BUSINESS_PEER_INVALID_HINT
+        return "⚠️ Не удалось отправить анимацию (смотри логи)."
     except Exception:
+        log.exception("Ошибка .anim в чате %s (bc=%s)", chat_id, bc_id)
         return "⚠️ Не удалось отправить анимацию (смотри логи)."
 
     return None
@@ -201,8 +225,10 @@ async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str
             sent_count += 1
             if sent_count < count:
                 await asyncio.sleep(SPAM_DELAY_SECONDS)
-    except TelegramAPIError:
+    except TelegramAPIError as e:
         log.exception("Ошибка .spam в чате %s (bc=%s) после %s из %s сообщений", chat_id, bc_id, sent_count, count)
+        if _is_business_peer_invalid(e):
+            return f"⚠️ Отправлено {sent_count} из {count}.\n\n{_BUSINESS_PEER_INVALID_HINT}"
         return f"⚠️ Отправлено {sent_count} из {count} — дальше упёрлось в ошибку (смотри логи)."
 
     return f"📨 Отправлено {sent_count} сообщений."
@@ -311,8 +337,10 @@ async def _send_result_to_chat(bot, bc_id, chat_id, text: str, error_prefix: str
         return "⚠️ Команда недоступна (нет доступа к боту)."
     try:
         await bot.send_message(business_connection_id=bc_id, chat_id=chat_id, text=text)
-    except TelegramAPIError:
+    except TelegramAPIError as e:
         log.exception("%s: не удалось отправить результат в чат %s (bc=%s)", error_prefix, chat_id, bc_id)
+        if _is_business_peer_invalid(e):
+            return _BUSINESS_PEER_INVALID_HINT
         return "⚠️ Не удалось отправить результат в чат (смотри логи)."
     return None
 
