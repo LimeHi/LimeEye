@@ -13,6 +13,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedIn
 from utils import parse_duration, human_duration, chat_info, sender_info, html_escape
 from tictactoe import new_board, render_text, render_keyboard
 import rps as rps_engine
+import hangman as hangman_engine
 
 log = logging.getLogger("LimeEye")
 
@@ -33,6 +34,9 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.rps</code> — камень-ножницы-бумага с собеседником прямо в чате (кнопки под сообщением).
    Оба выбирают втайне, потом бот раскрывает результат.
 <code>.rps stop</code> — досрочно завершить текущий раунд в этом чате.
+<code>.hangman</code> — виселица: бот сам загадывает слово, оба игрока по очереди
+   жмут буквы на клавиатуре под сообщением (6 ошибок на двоих).
+<code>.hangman stop</code> — досрочно завершить текущую игру в этом чате.
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
    Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
@@ -504,6 +508,79 @@ async def cmd_rps(chat_id, args, storage, bc_id, message=None, bot=None) -> str 
     return None
 
 
+async def cmd_hangman(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
+    if bot is None or message is None:
+        return "⚠️ Игра недоступна (нет доступа к боту)."
+
+    arg = (args or "").strip().lower()
+    if arg in ("stop", "cancel", "стоп"):
+        existing = await storage.get_hangman_game(bc_id, chat_id)
+        if not existing:
+            return "Игра в этом чате не запущена."
+        await storage.delete_hangman_game(bc_id, chat_id)
+
+        outcome = "не найдено (уже удалено?)"
+        if existing.get("message_id"):
+            try:
+                await bot.delete_business_messages(
+                    business_connection_id=bc_id,
+                    message_ids=[existing["message_id"]],
+                )
+                outcome = "сообщение с игрой удалено из чата"
+            except TelegramAPIError:
+                log.info(
+                    "Не удалось удалить .hangman-сообщение %s в чате %s (нет прав?), "
+                    "обновляю текст вместо удаления", existing["message_id"], chat_id,
+                )
+                try:
+                    stopped_text = "🪢 <b>Виселица</b>\n\n⏹ Игра остановлена."
+                    await bot.edit_message_text(
+                        business_connection_id=bc_id,
+                        chat_id=chat_id,
+                        message_id=existing["message_id"],
+                        text=stopped_text,
+                        reply_markup=None,
+                    )
+                    outcome = "нет права на удаление — заменил текст на «игра остановлена»"
+                except TelegramAPIError:
+                    log.exception(
+                        "Не удалось обновить .hangman-сообщение %s в чате %s после stop",
+                        existing["message_id"], chat_id,
+                    )
+                    outcome = "не удалось ни удалить, ни обновить сообщение (смотри логи)"
+
+        return f"⏹ Игра остановлена ({outcome})."
+
+    x_name = sender_info(message)["name"]
+    o_name = chat_info(message)["name"]
+    word = hangman_engine.new_word()
+    text = hangman_engine.render_text(word, set(), set(), x_name, o_name, status="playing")
+    keyboard = hangman_engine.render_keyboard(word, set(), finished=False)
+
+    try:
+        sent = await bot.send_message(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        log.exception("Не удалось отправить игровое поле .hangman в чат %s (bc=%s)", chat_id, bc_id)
+        return "⚠️ Не удалось начать игру (смотри логи)."
+
+    await storage.start_hangman_game(
+        business_connection_id=bc_id,
+        chat_id=chat_id,
+        word=word,
+        x_user_id=message.from_user.id,
+        x_name=x_name,
+        o_user_id=chat_id,
+        o_name=o_name,
+        message_id=sent.message_id,
+    )
+    return None
+
+
 async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     if bot is None or message is None:
         return "⚠️ Игра недоступна (нет доступа к боту)."
@@ -600,6 +677,7 @@ COMMANDS = {
     "export": cmd_export,
     "currency": cmd_currency,
     "rps": cmd_rps,
+    "hangman": cmd_hangman,
     "tic": cmd_tic,
     "help": cmd_help,
 }
@@ -784,6 +862,31 @@ HELP_ITEMS = [
                     "Досрочно завершает текущий раунд в этом чате: убирает сообщение с игрой "
                     "(или, если прав на удаление нет, помечает его как остановленное) — после "
                     "этого можно начать заново командой <code>.rps</code>."
+                ),
+            },
+        ],
+    },
+    {
+        "key": "hangman",
+        "button": "🪢 .hangman",
+        "title": "🪢 .hangman",
+        "desc": (
+            "Виселица. Слово загадывает сам бот (из встроенного словаря) — играть могут "
+            "<b>оба</b> участника чата, жмут буквы на клавиатуре под сообщением, не по "
+            "заранее заданной очереди, а кто успел. Правильная буква открывается на своём "
+            "месте, неверная — добавляет часть к рисунку виселицы. 6 ошибок на двоих — и "
+            "игра проиграна; все буквы открыты — победа. Слово в любом случае показывается "
+            "целиком по завершении, с кнопкой «🔄 Играть снова»."
+        ),
+        "subs": [
+            {
+                "key": "stop",
+                "button": ".hangman stop — остановить игру",
+                "title": ".hangman stop",
+                "desc": (
+                    "Досрочно завершает текущую игру в этом чате: убирает сообщение с игрой "
+                    "(или, если прав на удаление нет, помечает его как остановленное) — после "
+                    "этого можно начать заново командой <code>.hangman</code>."
                 ),
             },
         ],

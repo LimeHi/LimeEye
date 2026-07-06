@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS rps_games (
     updated_at INTEGER,
     PRIMARY KEY (business_connection_id, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS hangman_games (
+    business_connection_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER,
+    word TEXT NOT NULL,
+    guessed TEXT NOT NULL DEFAULT '',   -- все открытые/угаданные буквы подряд, без разделителей
+    wrong TEXT NOT NULL DEFAULT '',     -- неверно угаданные буквы подряд, без разделителей
+    status TEXT NOT NULL,               -- 'playing' | 'won' | 'lost'
+    x_user_id INTEGER,
+    x_name TEXT,
+    o_user_id INTEGER,
+    o_name TEXT,
+    updated_at INTEGER,
+    PRIMARY KEY (business_connection_id, chat_id)
+);
 """
 
 # Колонки, добавленные уже после первого релиза — накатываются на существующие
@@ -424,6 +440,55 @@ class Storage:
     async def delete_rps_game(self, business_connection_id, chat_id):
         await self._db.execute(
             "DELETE FROM rps_games WHERE business_connection_id = ? AND chat_id = ?",
+            (business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    # ---------- hangman_games (виселица) ----------
+
+    async def start_hangman_game(self, business_connection_id, chat_id, word,
+                                  x_user_id, x_name, o_user_id, o_name, message_id):
+        await self._db.execute(
+            """INSERT INTO hangman_games
+               (business_connection_id, chat_id, message_id, word, guessed, wrong, status,
+                x_user_id, x_name, o_user_id, o_name, updated_at)
+               VALUES (?, ?, ?, ?, '', '', 'playing', ?, ?, ?, ?, ?)
+               ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
+                   message_id=excluded.message_id, word=excluded.word,
+                   guessed='', wrong='', status='playing',
+                   x_user_id=excluded.x_user_id, x_name=excluded.x_name,
+                   o_user_id=excluded.o_user_id, o_name=excluded.o_name,
+                   updated_at=excluded.updated_at""",
+            (business_connection_id, chat_id, message_id, word,
+             x_user_id, x_name, o_user_id, o_name, int(time.time())),
+        )
+        await self._db.commit()
+
+    async def get_hangman_game(self, business_connection_id, chat_id):
+        cur = await self._db.execute(
+            "SELECT business_connection_id, chat_id, message_id, word, guessed, wrong, status, "
+            "x_user_id, x_name, o_user_id, o_name "
+            "FROM hangman_games WHERE business_connection_id = ? AND chat_id = ?",
+            (business_connection_id, chat_id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        keys = ["business_connection_id", "chat_id", "message_id", "word", "guessed", "wrong",
+                "status", "x_user_id", "x_name", "o_user_id", "o_name"]
+        return dict(zip(keys, row))
+
+    async def apply_hangman_guess(self, business_connection_id, chat_id, guessed, wrong, status):
+        await self._db.execute(
+            "UPDATE hangman_games SET guessed = ?, wrong = ?, status = ?, updated_at = ? "
+            "WHERE business_connection_id = ? AND chat_id = ?",
+            (guessed, wrong, status, int(time.time()), business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    async def delete_hangman_game(self, business_connection_id, chat_id):
+        await self._db.execute(
+            "DELETE FROM hangman_games WHERE business_connection_id = ? AND chat_id = ?",
             (business_connection_id, chat_id),
         )
         await self._db.commit()

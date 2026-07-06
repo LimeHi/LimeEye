@@ -18,6 +18,7 @@ from commands import (
 from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html
 from tictactoe import EMPTY, new_board, apply_move, check_result, other_mark, render_text, render_keyboard
 import rps as rps_engine
+import hangman as hangman_engine
 
 BOT_NAME = "LimeEye"
 
@@ -503,6 +504,109 @@ async def on_rps_callback(callback: types.CallbackQuery):
         log.exception("Не удалось обновить .rps в чате %s", chat_id)
 
     await callback.answer(f"Твой выбор: {rps_engine.CHOICES[choice]}")
+
+
+@dp.callback_query(F.data.startswith("hm:"))
+async def on_hangman_callback(callback: types.CallbackQuery):
+    data = callback.data
+    message = callback.message
+    bc_id = getattr(message, "business_connection_id", None) if message else None
+
+    if message is None or not bc_id:
+        await callback.answer()
+        return
+
+    chat_id = message.chat.id
+
+    if data == "hm:noop":
+        await callback.answer()
+        return
+
+    game = await storage.get_hangman_game(bc_id, chat_id)
+    if not game:
+        await callback.answer("Игра не найдена или уже завершена.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    if user_id not in (game["x_user_id"], game["o_user_id"]):
+        await callback.answer("Ты не участвуешь в этой игре.", show_alert=True)
+        return
+
+    # --- перезапуск после завершённой игры ---
+    if data == "hm:restart":
+        if game["status"] == "playing":
+            await callback.answer("Игра ещё не закончена.", show_alert=True)
+            return
+
+        word = hangman_engine.new_word()
+        await storage.start_hangman_game(
+            bc_id, chat_id, word,
+            game["x_user_id"], game["x_name"], game["o_user_id"], game["o_name"],
+            message.message_id,
+        )
+        text = hangman_engine.render_text(word, set(), set(), game["x_name"], game["o_name"], status="playing")
+        keyboard = hangman_engine.render_keyboard(word, set(), finished=False)
+        try:
+            await bot.edit_message_text(
+                business_connection_id=bc_id, chat_id=chat_id,
+                message_id=message.message_id, text=text, reply_markup=keyboard,
+            )
+        except TelegramAPIError:
+            log.exception("Не удалось перезапустить .hangman в чате %s", chat_id)
+        await callback.answer("Новое слово!")
+        return
+
+    if game["status"] != "playing":
+        await callback.answer("Игра уже завершена — нажми «Играть снова».", show_alert=True)
+        return
+
+    if game.get("message_id") and message.message_id != game["message_id"]:
+        await callback.answer("Это старая игра, начни новую через .hangman", show_alert=True)
+        return
+
+    try:
+        letter = data.split(":", 2)[2]
+    except IndexError:
+        await callback.answer()
+        return
+
+    word = game["word"]
+    guessed = set(game["guessed"])
+    wrong = set(game["wrong"])
+
+    if letter in guessed or letter in wrong:
+        await callback.answer("Эта буква уже использована.", show_alert=True)
+        return
+
+    if letter in word:
+        guessed.add(letter)
+    else:
+        wrong.add(letter)
+
+    if all(l in guessed for l in word):
+        status = "won"
+    elif len(wrong) >= hangman_engine.MAX_WRONG:
+        status = "lost"
+    else:
+        status = "playing"
+
+    guessed_str = "".join(sorted(guessed))
+    wrong_str = "".join(sorted(wrong))
+    await storage.apply_hangman_guess(bc_id, chat_id, guessed_str, wrong_str, status)
+
+    finished = status != "playing"
+    text = hangman_engine.render_text(word, guessed, wrong, game["x_name"], game["o_name"], status=status)
+    keyboard = hangman_engine.render_keyboard(word, guessed | wrong, finished=finished)
+
+    try:
+        await bot.edit_message_text(
+            business_connection_id=bc_id, chat_id=chat_id,
+            message_id=message.message_id, text=text, reply_markup=keyboard,
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось обновить .hangman в чате %s", chat_id)
+
+    await callback.answer()
 
 
 CACHE_PURGE_INTERVAL_SECONDS = 6 * 3600  # проверяем раз в 6 часов
