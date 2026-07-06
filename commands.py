@@ -32,7 +32,7 @@ HELP_TEXT = """<b>LimeEye — команды</b>
    Пример: <code>.cal (2 + 3) * 4 / 7</code>, <code>.cal sqrt(2) + pi</code>
 <code>.short ссылка</code> — сократить длинную ссылку, ответ приходит сюда.
 <code>.export</code> — выгрузить всю кэшированную переписку этого чата в .txt-файл себе в личку.
-<code>.currency СУММА ИЗ В</code> — конвертер валют (курс ЕЦБ), ответ приходит сюда.
+<code>.currency СУММА ИЗ В</code> — конвертер валют (курс на сегодня), ответ приходит сюда.
    Пример: <code>.currency 100 USD RUB</code>
 <code>.rps</code> — камень-ножницы-бумага с собеседником прямо в чате (кнопки под сообщением).
    Оба выбирают втайне, потом бот раскрывает результат.
@@ -407,6 +407,51 @@ async def cmd_cal(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
+SHORTENER_UA = "LimeEyeBot/1.0 (+https://github.com/limeeye; contact via Telegram)"
+
+
+async def _shorten_isgd(session: aiohttp.ClientSession, url: str) -> str | None:
+    """Возвращает короткую ссылку или None, если is.gd не смог (ошибка/рейт-лимит)."""
+    try:
+        async with session.get(
+            "https://is.gd/create.php",
+            params={"format": "simple", "url": url},
+            headers={"User-Agent": SHORTENER_UA},
+        ) as resp:
+            text = (await resp.text()).strip()
+    except Exception:
+        log.exception(".short: не удалось обратиться к is.gd (url=%r)", url)
+        return None
+
+    if not text.startswith("http"):
+        # is.gd часто отдаёт "Error: ..." (в т.ч. рейт-лимит для облачных IP типа Railway) —
+        # в этом случае просто пробуем запасной сервис, а не показываем ошибку сразу.
+        log.warning(".short: is.gd вернул ошибку (url=%r): %s", url, text[:200])
+        return None
+
+    return text
+
+
+async def _shorten_tinyurl(session: aiohttp.ClientSession, url: str) -> str | None:
+    """Запасной сокращатель на случай, если is.gd недоступен/зарейтлимитил."""
+    try:
+        async with session.get(
+            "https://tinyurl.com/api-create.php",
+            params={"url": url},
+            headers={"User-Agent": SHORTENER_UA},
+        ) as resp:
+            text = (await resp.text()).strip()
+    except Exception:
+        log.exception(".short: не удалось обратиться к tinyurl (url=%r)", url)
+        return None
+
+    if not text.startswith("http"):
+        log.warning(".short: tinyurl вернул неожиданный ответ (url=%r): %s", url, text[:200])
+        return None
+
+    return text
+
+
 async def cmd_short(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     url = (args or "").strip()
     if not url:
@@ -414,21 +459,15 @@ async def cmd_short(chat_id, args, storage, bc_id, message=None, bot=None) -> st
     if not (url.startswith("http://") or url.startswith("https://")):
         url = "https://" + url
 
-    try:
-        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-            async with session.get(
-                "https://is.gd/create.php",
-                params={"format": "simple", "url": url},
-            ) as resp:
-                text = (await resp.text()).strip()
-    except Exception:
-        log.exception(".short: не удалось обратиться к is.gd (url=%r)", url)
-        return "⚠️ Не удалось сократить ссылку (сервис недоступен, смотри логи)."
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+        short = await _shorten_isgd(session, url)
+        if not short:
+            short = await _shorten_tinyurl(session, url)
 
-    if not text.startswith("http"):
-        return f"⚠️ Не удалось сократить ссылку: {html_escape(text)}"
+    if not short:
+        return "⚠️ Не удалось сократить ссылку (оба сервиса недоступны, смотри логи)."
 
-    return f"🔗 {html_escape(text)}"
+    return f"🔗 {html_escape(short)}"
 
 
 async def cmd_export(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
@@ -485,31 +524,37 @@ async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) ->
     except ValueError:
         return "⚠️ Сумма должна быть числом. Пример: <code>.currency 100 USD RUB</code>"
 
+    # Раньше здесь был Frankfurter (курсы ЕЦБ) — но ЕЦБ не публикует курс RUB (и ряда других
+    # валют) с 2022 года, поэтому даже пример из подсказки (.currency 100 USD RUB) всегда падал
+    # с "не нашёл курс". open.er-api.com покрывает ~160 валют, включая RUB, без ключей и лимитов.
     try:
         async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             async with session.get(
-                "https://api.frankfurter.dev/v1/latest",
-                params={"amount": amount, "from": from_code, "to": to_code},
+                f"https://open.er-api.com/v6/latest/{from_code}",
             ) as resp:
                 if resp.status != 200:
                     err_body = await resp.text()
-                    log.warning(".currency: frankfurter вернул %s: %s", resp.status, err_body[:300])
+                    log.warning(".currency: open.er-api вернул %s: %s", resp.status, err_body[:300])
                     return f"⚠️ Не удалось получить курс — проверь коды валют ({from_code} → {to_code})."
                 data = await resp.json()
     except Exception:
-        log.exception(".currency: ошибка запроса к frankfurter (%s -> %s)", from_code, to_code)
+        log.exception(".currency: ошибка запроса к open.er-api (%s -> %s)", from_code, to_code)
         return "⚠️ Не удалось получить курс валют (сервис недоступен, смотри логи)."
+
+    if data.get("result") != "success":
+        err_type = data.get("error-type", "unknown")
+        return f"⚠️ Не нашёл курс для {from_code} → {to_code} (код ошибки: {html_escape(str(err_type))})."
 
     rates = data.get("rates") or {}
     if to_code not in rates:
         return f"⚠️ Не нашёл курс {from_code} → {to_code}. Проверь коды валют (ISO, например USD, EUR, RUB)."
 
-    converted = rates[to_code]
-    rate_date = data.get("date", "")
+    converted = amount * rates[to_code]
+    rate_date = data.get("time_last_update_utc", "")
 
     return (
         f"💱 {amount:g} {from_code} = <b>{converted:,.2f} {to_code}</b>\n"
-        f"<i>курс ЕЦБ на {rate_date}</i>"
+        f"<i>курс на {html_escape(rate_date)}</i>"
     )
 
 
@@ -896,7 +941,7 @@ HELP_ITEMS = [
         "key": "short",
         "button": "🔗 .short",
         "title": "🔗 .short ссылка",
-        "desc": "Сокращает длинную ссылку через is.gd. Ответ (короткая ссылка) приходит сюда, в чат с ботом.",
+        "desc": "Сокращает длинную ссылку (is.gd, а если он недоступен — TinyURL). Ответ (короткая ссылка) приходит сюда, в чат с ботом.",
         "subs": [
             {
                 "key": "usage",
@@ -924,7 +969,7 @@ HELP_ITEMS = [
         "button": "💱 .currency",
         "title": "💱 .currency СУММА ИЗ В",
         "desc": (
-            "Конвертер валют по курсу ЕЦБ (данные Frankfurter, без ключей и лимитов). "
+            "Конвертер валют (без ключей и лимитов), поддерживает ~160 валют, включая RUB. "
             "Ответ приходит сюда, в чат с ботом.\n\n"
             "Коды валют — трёхбуквенные (ISO 4217): USD, EUR, RUB, GBP и т.д."
         ),

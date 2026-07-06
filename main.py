@@ -22,6 +22,7 @@ import rps as rps_engine
 import hangman as hangman_engine
 
 BOT_NAME = "LimeEye"
+BOT_USERNAME: str | None = None  # заполняется в main() через bot.get_me()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(BOT_NAME)
@@ -73,6 +74,29 @@ async def on_direct_message(message: types.Message):
         return
 
     if message.text.startswith("/start"):
+        bc_ids = await storage.get_owner_connections(message.chat.id)
+        if not bc_ids:
+            # Пользователь ещё не подключил бота как Business-чатбота — даём быстрый способ
+            # попасть в нужный раздел настроек и скопировать username одним тапом.
+            username_line = f"@{BOT_USERNAME}" if BOT_USERNAME else BOT_NAME
+            kb = None
+            if BOT_USERNAME:
+                kb = types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(text="⚙️ Открыть настройки Telegram", url="tg://settings/edit")
+                ]])
+            await message.answer(
+                f"👋 {BOT_NAME} запущен, но ещё не подключён к твоему аккаунту.\n\n"
+                f"1️⃣ Нажми на юзернейм ниже, чтобы скопировать его:\n<code>{username_line}</code>\n\n"
+                "2️⃣ Жми кнопку «Открыть настройки Telegram» ниже (или сам: Настройки → "
+                "Telegram Business → Чат-боты).\n"
+                "3️⃣ Вставь скопированный юзернейм в поле поиска бота, выбери меня и включи "
+                "право «Удаление сообщений», если хочешь пользоваться .mute.\n\n"
+                "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же.",
+                reply_markup=kb,
+            )
+            await message.answer(build_help_root_text(), reply_markup=build_help_root_kb())
+            return
+
         await message.answer(
             f"👋 {BOT_NAME} запущен.\n\n"
             "Подключи меня к своему аккаунту: Настройки → Telegram Business → Чат-боты, "
@@ -598,6 +622,8 @@ async def cache_purge_loop():
 async def main():
     await storage.init()
     me = await bot.get_me()
+    global BOT_USERNAME
+    BOT_USERNAME = me.username
     log.info("%s запущен как @%s", BOT_NAME, me.username)
 
     await bot.set_my_commands([
