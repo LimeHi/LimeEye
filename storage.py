@@ -1,7 +1,43 @@
 import time
 import aiosqlite
+from cryptography.fernet import Fernet, InvalidToken
 
-from config import DB_PATH, CACHE_LIMIT_PER_CHAT
+from config import DB_PATH, CACHE_LIMIT_PER_CHAT, DB_ENCRYPTION_KEY
+
+_fernet = Fernet(DB_ENCRYPTION_KEY.encode() if isinstance(DB_ENCRYPTION_KEY, str) else DB_ENCRYPTION_KEY)
+
+
+def _enc(value: str | None) -> str | None:
+    """Шифрует строку перед записью в БД. None остаётся None (не шифруем отсутствие данных)."""
+    if value is None:
+        return None
+    return _fernet.encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def _dec(value: str | None) -> str | None:
+    """Расшифровывает строку, прочитанную из БД.
+
+    Устойчиво к старым/битым записям: если значение не похоже на токен Fernet
+    (например, это данные из БД, созданной до включения шифрования), возвращаем
+    как есть, а не роняем бота."""
+    if value is None:
+        return None
+    try:
+        return _fernet.decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError):
+        return value
+
+
+_MESSAGE_ENCRYPTED_FIELDS = (
+    "sender_name", "sender_username", "chat_name", "chat_username", "text", "media_file_id",
+)
+
+
+def _decrypt_message_row(row: dict) -> dict:
+    for field in _MESSAGE_ENCRYPTED_FIELDS:
+        if field in row:
+            row[field] = _dec(row[field])
+    return row
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS connections (
@@ -197,8 +233,9 @@ class Storage:
                  media_file_id=excluded.media_file_id,
                  date=excluded.date
             """,
-            (business_connection_id, chat_id, msg_id, sender_id, sender_name, sender_username,
-             chat_name, chat_username, text, media_type, media_kind, media_file_id, int(time.time())),
+            (business_connection_id, chat_id, msg_id, sender_id, _enc(sender_name), _enc(sender_username),
+             _enc(chat_name), _enc(chat_username), _enc(text), media_type, media_kind,
+             _enc(media_file_id), int(time.time())),
         )
         await self._db.commit()
         await self._trim(business_connection_id, chat_id)
@@ -230,7 +267,7 @@ class Storage:
         keys = ["business_connection_id", "chat_id", "msg_id", "sender_id", "sender_name",
                 "sender_username", "chat_name", "chat_username", "text", "media_type",
                 "media_kind", "media_file_id", "date"]
-        return dict(zip(keys, row))
+        return _decrypt_message_row(dict(zip(keys, row)))
 
     async def clear_chat_cache(self, business_connection_id, chat_id):
         await self._db.execute(
@@ -253,7 +290,7 @@ class Storage:
         keys = ["business_connection_id", "chat_id", "msg_id", "sender_id", "sender_name",
                 "sender_username", "chat_name", "chat_username", "text", "media_type",
                 "media_kind", "media_file_id", "date"]
-        return [dict(zip(keys, row)) for row in rows]
+        return [_decrypt_message_row(dict(zip(keys, row))) for row in rows]
 
     async def purge_old_cache(self, max_age_seconds: int) -> int:
         """Удаляет из кэша сообщения старше max_age_seconds. Возвращает число
@@ -278,7 +315,7 @@ class Storage:
                ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
                  until_ts=excluded.until_ts, muted_at=excluded.muted_at,
                  chat_name=excluded.chat_name, chat_username=excluded.chat_username""",
-            (business_connection_id, chat_id, until_ts, int(time.time()), chat_name, chat_username),
+            (business_connection_id, chat_id, until_ts, int(time.time()), _enc(chat_name), _enc(chat_username)),
         )
         await self._db.commit()
 
@@ -309,7 +346,9 @@ class Storage:
             "FROM muted_chats WHERE business_connection_id = ?",
             (business_connection_id,),
         )
-        return await cur.fetchall()
+        rows = await cur.fetchall()
+        return [(chat_id, until_ts, _dec(chat_name), _dec(chat_username))
+                for chat_id, until_ts, chat_name, chat_username in rows]
 
     # ---------- поиск подключений владельца (для команд в личке с ботом) ----------
 
@@ -344,7 +383,7 @@ class Storage:
                  updated_at=excluded.updated_at
             """,
             (business_connection_id, chat_id, message_id, board, turn,
-             x_user_id, x_name, o_user_id, o_name, int(time.time())),
+             x_user_id, _enc(x_name), o_user_id, _enc(o_name), int(time.time())),
         )
         await self._db.commit()
 
@@ -367,7 +406,10 @@ class Storage:
             return None
         keys = ["business_connection_id", "chat_id", "message_id", "board", "turn", "status",
                 "x_user_id", "x_name", "o_user_id", "o_name"]
-        return dict(zip(keys, row))
+        data = dict(zip(keys, row))
+        data["x_name"] = _dec(data["x_name"])
+        data["o_name"] = _dec(data["o_name"])
+        return data
 
     async def update_game_board(self, business_connection_id, chat_id, board, turn, status):
         await self._db.execute(
@@ -398,8 +440,8 @@ class Storage:
                    x_user_id=excluded.x_user_id, x_name=excluded.x_name, x_choice=NULL,
                    o_user_id=excluded.o_user_id, o_name=excluded.o_name, o_choice=NULL,
                    updated_at=excluded.updated_at""",
-            (business_connection_id, chat_id, message_id, x_user_id, x_name,
-             o_user_id, o_name, int(time.time())),
+            (business_connection_id, chat_id, message_id, x_user_id, _enc(x_name),
+             o_user_id, _enc(o_name), int(time.time())),
         )
         await self._db.commit()
 
@@ -415,7 +457,10 @@ class Storage:
             return None
         keys = ["business_connection_id", "chat_id", "message_id", "status",
                 "x_user_id", "x_name", "x_choice", "o_user_id", "o_name", "o_choice"]
-        return dict(zip(keys, row))
+        data = dict(zip(keys, row))
+        data["x_name"] = _dec(data["x_name"])
+        data["o_name"] = _dec(data["o_name"])
+        return data
 
     async def set_rps_choice(self, business_connection_id, chat_id, side, choice):
         """side — 'x_choice' или 'o_choice'."""
@@ -465,8 +510,8 @@ class Storage:
                    x_user_id=excluded.x_user_id, x_name=excluded.x_name,
                    o_user_id=excluded.o_user_id, o_name=excluded.o_name,
                    updated_at=excluded.updated_at""",
-            (business_connection_id, chat_id, message_id, word,
-             x_user_id, x_name, o_user_id, o_name, int(time.time())),
+            (business_connection_id, chat_id, message_id, _enc(word),
+             x_user_id, _enc(x_name), o_user_id, _enc(o_name), int(time.time())),
         )
         await self._db.commit()
 
@@ -482,7 +527,11 @@ class Storage:
             return None
         keys = ["business_connection_id", "chat_id", "message_id", "word", "guessed", "wrong",
                 "status", "x_user_id", "x_name", "o_user_id", "o_name"]
-        return dict(zip(keys, row))
+        data = dict(zip(keys, row))
+        data["word"] = _dec(data["word"])
+        data["x_name"] = _dec(data["x_name"])
+        data["o_name"] = _dec(data["o_name"])
+        return data
 
     async def apply_hangman_guess(self, business_connection_id, chat_id, guessed, wrong, status):
         await self._db.execute(
@@ -507,7 +556,7 @@ class Storage:
                VALUES (?, ?, ?)
                ON CONFLICT(owner_chat_id) DO UPDATE SET
                    word=excluded.word, created_at=excluded.created_at""",
-            (owner_chat_id, word, int(time.time())),
+            (owner_chat_id, _enc(word), int(time.time())),
         )
         await self._db.commit()
 
@@ -517,7 +566,7 @@ class Storage:
             (owner_chat_id,),
         )
         row = await cur.fetchone()
-        return row[0] if row else None
+        return _dec(row[0]) if row else None
 
     async def pop_pending_hangman_word(self, owner_chat_id):
         word = await self.get_pending_hangman_word(owner_chat_id)
