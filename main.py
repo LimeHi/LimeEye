@@ -142,11 +142,15 @@ async def on_direct_message(message: types.Message):
         bc_ids = await storage.get_owner_connections(message.chat.id)
         if not bc_ids:
             username_line = f"@{BOT_USERNAME}" if BOT_USERNAME else BOT_NAME
-            kb = None
+            kb_rows = []
             if BOT_USERNAME:
-                kb = types.InlineKeyboardMarkup(inline_keyboard=[[
+                kb_rows.append([
                     types.InlineKeyboardButton(text="⚙️ Открыть настройки Telegram", url="tg://settings/edit")
-                ]])
+                ])
+            kb_rows.append([
+                types.InlineKeyboardButton(text="📋 Список команд", callback_data="help:root")
+            ])
+            kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
             await message.answer(
                 f"👋 {BOT_NAME} запущен, но ещё не подключён к твоему аккаунту.\n\n"
                 f"1️⃣ Нажми на юзернейм ниже, чтобы скопировать его:\n<code>{username_line}</code>\n\n"
@@ -157,16 +161,18 @@ async def on_direct_message(message: types.Message):
                 "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же.",
                 reply_markup=kb,
             )
-            await message.answer(build_help_root_text(), reply_markup=build_help_root_kb())
             return
 
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="📋 Список команд", callback_data="help:root")
+        ]])
         await message.answer(
             f"👋 {BOT_NAME} запущен.\n\n"
             "Подключи меня к своему аккаунту: Настройки → Автоматизация чатов, "
             "выбери меня и включи право «Удаление сообщений», если хочешь пользоваться .mute.\n\n"
-            "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же."
+            "Отчёты об удалённых/изменённых сообщениях и ответы на команды будут приходить сюда же.",
+            reply_markup=kb,
         )
-        await message.answer(build_help_root_text(), reply_markup=build_help_root_kb())
         return
 
     if message.text.startswith("/help"):
