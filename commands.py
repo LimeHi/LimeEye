@@ -24,6 +24,7 @@ HELP_TEXT = """<b>LimeEye — команды</b>
    Без аргумента — навсегда. Пример: <code>.mute 1h30m</code>, <code>.mute 2d</code>, <code>.mute</code>
 <code>.unmute</code> — снять мьют с этого чата.
 <code>.nomute текст</code> — отправить сообщение от лица бота (оригинальная команда удаляется).
+<code>.save</code> — сохранить исчезающее фото/медиа (нужно ответить на сообщение).
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
 <code>.cal выражение</code> — калькулятор, ответ приходит сюда, в чат с ботом.
@@ -127,6 +128,66 @@ async def cmd_nomute(chat_id, args, storage, bc_id, message=None, bot=None) -> s
     except TelegramAPIError:
         log.exception("Ошибка .nomute в чате %s (bc=%s)", chat_id, bc_id)
         return "⚠️ Не удалось отправить сообщение (смотри логи)."
+
+    return None
+
+
+async def cmd_save(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
+    if bot is None or message is None:
+        return "⚠️ Команда недоступна (нет доступа к боту)."
+
+    reply = message.reply_to_message
+    if not reply:
+        return "⚠️ Ответь этой командой на медиа (в том числе исчезающее), которое нужно сохранить."
+
+    conn = await storage.get_connection(bc_id)
+    if not conn or not conn.get("owner_chat_id"):
+        return "⚠️ Не найдено подключение к владельцу."
+
+    media_id = None
+    media_type = None
+
+    if reply.photo:
+        media_id = reply.photo[-1].file_id
+        media_type = "photo"
+    elif reply.video:
+        media_id = reply.video.file_id
+        media_type = "video"
+    elif reply.voice:
+        media_id = reply.voice.file_id
+        media_type = "voice"
+    elif reply.video_note:
+        media_id = reply.video_note.file_id
+        media_type = "video_note"
+    elif reply.animation:
+        media_id = reply.animation.file_id
+        media_type = "animation"
+    elif reply.document:
+        media_id = reply.document.file_id
+        media_type = "document"
+    elif reply.audio:
+        media_id = reply.audio.file_id
+        media_type = "audio"
+    else:
+        return "⚠️ В отвеченном сообщении нет поддерживаемого медиа."
+
+    owner_chat = conn["owner_chat_id"]
+    method = getattr(bot, f"send_{media_type}", None)
+    if not method:
+        return "⚠️ Ошибка отправки: неподдерживаемый тип медиа."
+
+    try:
+        kwargs = {
+            "chat_id": owner_chat,
+            media_type: media_id,
+            "caption": "📸 <b>Сохранённое медиа</b>"
+        }
+        if reply.caption:
+            kwargs["caption"] += f"\n\nПодпись: {html_escape(reply.caption)}"
+        await method(**kwargs)
+    except TelegramAPIError:
+        log.exception("Не удалось сохранить медиа из чата %s (bc=%s)", chat_id, bc_id)
+        return "⚠️ Не удалось сохранить медиа (возможно, оно уже недоступно)."
 
     return None
 
@@ -670,6 +731,7 @@ COMMANDS = {
     "mute": cmd_mute,
     "unmute": cmd_unmute,
     "nomute": cmd_nomute,
+    "save": cmd_save,
     "anim": cmd_anim,
     "spam": cmd_spam,
     "cal": cmd_cal,
@@ -730,6 +792,18 @@ HELP_ITEMS = [
             "Бот отправляет указанный текст от своего имени. "
             "Оригинальное сообщение с командой удаляется. "
             "Может использоваться для обхода некоторых видов ограничений в чате."
+        ),
+        "subs": [],
+    },
+    {
+        "key": "save",
+        "button": "💾 .save",
+        "title": "💾 .save",
+        "desc": (
+            "Сохраняет медиа (фото, видео, голосовые и т.д.) из сообщения, "
+            "на которое ты ответил этой командой. "
+            "Полезно для сохранения исчезающих фото или видео. "
+            "Файл будет отправлен тебе в личку с ботом."
         ),
         "subs": [],
     },
