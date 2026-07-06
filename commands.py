@@ -25,7 +25,6 @@ HELP_TEXT = """<b>LimeEye — команды</b>
    Без аргумента — навсегда. Пример: <code>.mute 1h30m</code>, <code>.mute 2d</code>, <code>.mute</code>
 <code>.unmute</code> — снять мьют с этого чата.
 <code>.nomute текст</code> — отправить сообщение от лица бота (оригинальная команда удаляется).
-<code>.save</code> — сохранить исчезающее фото/медиа (нужно ответить на сообщение).
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
 <code>.cal выражение</code> — калькулятор, ответ приходит прямо в этот чат.
@@ -35,19 +34,18 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.currency СУММА ИЗ В</code> — конвертер валют (курс на сегодня), ответ приходит прямо в этот чат.
    Пример: <code>.currency 100 USD RUB</code>
 <code>.rps</code> — камень-ножницы-бумага с собеседником прямо в чате (кнопки под сообщением).
-   Оба выбирают втайне, потом бот раскрывает результат.
 <code>.rps stop</code> — досрочно завершить текущий раунд в этом чате.
 <code>.hangman</code> — виселица: бот сам загадывает слово, оба игрока по очереди
    жмут буквы на клавиатуре под сообщением (6 ошибок на двоих).
 <code>.hangman stop</code> — досрочно завершить текущую игру в этом чате.
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
-   Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
 <code>.help</code> — это сообщение.
 
+📸 <b>Фото Ловушка:</b> просто ответь любым сообщением на исчезающее фото/видео (или любое медиа), и бот автоматически скачает его тебе в личку.
+
 Список замьюченных чатов смотри командой /muted прямо в чате с ботом (не здесь).
-Кэш сообщений (для save/edit-отчётов) очищается автоматически сам через
-несколько дней — вручную чистить не нужно.
+Кэш сообщений (для save/edit-отчётов) очищается автоматически сам через несколько дней.
 
 Учти: для <code>.mute</code> и очистки самой команды из чата нужно, чтобы при
 подключении бота в Settings → Автоматизация чатов было включено
@@ -129,81 +127,6 @@ async def cmd_nomute(chat_id, args, storage, bc_id, message=None, bot=None) -> s
     except TelegramAPIError:
         log.exception("Ошибка .nomute в чате %s (bc=%s)", chat_id, bc_id)
         return "⚠️ Не удалось отправить сообщение (смотри логи)."
-
-    return None
-
-
-async def cmd_save(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
-    if bot is None or message is None:
-        return "⚠️ Команда недоступна (нет доступа к боту)."
-
-    reply = message.reply_to_message
-    if not reply:
-        return "⚠️ Ответь этой командой на медиа (в том числе исчезающее), которое нужно сохранить."
-
-    conn = await storage.get_connection(bc_id)
-    if not conn or not conn.get("owner_chat_id"):
-        return "⚠️ Не найдено подключение к владельцу."
-
-    media_id = None
-    media_type = None
-    filename = "file"
-
-    if reply.photo:
-        media_id = reply.photo[-1].file_id
-        media_type = "photo"
-        filename = "photo.jpg"
-    elif reply.video:
-        media_id = reply.video.file_id
-        media_type = "video"
-        filename = "video.mp4"
-    elif reply.voice:
-        media_id = reply.voice.file_id
-        media_type = "voice"
-        filename = "voice.ogg"
-    elif reply.video_note:
-        media_id = reply.video_note.file_id
-        media_type = "video_note"
-        filename = "video_note.mp4"
-    elif reply.animation:
-        media_id = reply.animation.file_id
-        media_type = "animation"
-        filename = "animation.mp4"
-    elif reply.document:
-        media_id = reply.document.file_id
-        media_type = "document"
-        filename = reply.document.file_name or "document"
-    elif reply.audio:
-        media_id = reply.audio.file_id
-        media_type = "audio"
-        filename = reply.audio.file_name or "audio.mp3"
-    else:
-        return "⚠️ В отвеченном сообщении нет поддерживаемого медиа."
-
-    owner_chat = conn["owner_chat_id"]
-    method = getattr(bot, f"send_{media_type}", None)
-    if not method:
-        return "⚠️ Ошибка отправки: неподдерживаемый тип медиа."
-
-    try:
-        file_buffer = BytesIO()
-        await bot.download(media_id, destination=file_buffer)
-        file_buffer.seek(0)
-        
-        input_file = BufferedInputFile(file_buffer.getvalue(), filename=filename)
-        
-        kwargs = {
-            "chat_id": owner_chat,
-            media_type: input_file,
-            "caption": "📸 <b>Сохранённое медиа</b>"
-        }
-        if reply.caption:
-            kwargs["caption"] += f"\n\nПодпись: {html_escape(reply.caption)}"
-            
-        await method(**kwargs)
-    except TelegramAPIError:
-        log.exception("Не удалось сохранить медиа из чата %s (bc=%s)", chat_id, bc_id)
-        return "⚠️ Не удалось сохранить медиа (возможно, срок действия файла истёк)."
 
     return None
 
@@ -384,8 +307,6 @@ def _cal_format(value) -> str:
 
 
 async def _send_result_to_chat(bot, bc_id, chat_id, text: str, error_prefix: str) -> str | None:
-    """Отправляет готовый ответ прямо в чат с собеседником (а не владельцу в личку).
-    Возвращает None при успехе, либо текст ошибки (уйдёт владельцу в личку через notify_owner)."""
     if bot is None:
         return "⚠️ Команда недоступна (нет доступа к боту)."
     try:
@@ -425,7 +346,6 @@ SHORTENER_UA = "LimeEyeBot/1.0 (+https://github.com/limeeye; contact via Telegra
 
 
 async def _shorten_isgd(session: aiohttp.ClientSession, url: str) -> str | None:
-    """Возвращает короткую ссылку или None, если is.gd не смог (ошибка/рейт-лимит)."""
     try:
         async with session.get(
             "https://is.gd/create.php",
@@ -438,8 +358,6 @@ async def _shorten_isgd(session: aiohttp.ClientSession, url: str) -> str | None:
         return None
 
     if not text.startswith("http"):
-        # is.gd часто отдаёт "Error: ..." (в т.ч. рейт-лимит для облачных IP типа Railway) —
-        # в этом случае просто пробуем запасной сервис, а не показываем ошибку сразу.
         log.warning(".short: is.gd вернул ошибку (url=%r): %s", url, text[:200])
         return None
 
@@ -447,7 +365,6 @@ async def _shorten_isgd(session: aiohttp.ClientSession, url: str) -> str | None:
 
 
 async def _shorten_tinyurl(session: aiohttp.ClientSession, url: str) -> str | None:
-    """Запасной сокращатель на случай, если is.gd недоступен/зарейтлимитил."""
     try:
         async with session.get(
             "https://tinyurl.com/api-create.php",
@@ -539,9 +456,6 @@ async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) ->
     except ValueError:
         return "⚠️ Сумма должна быть числом. Пример: <code>.currency 100 USD RUB</code>"
 
-    # Раньше здесь был Frankfurter (курсы ЕЦБ) — но ЕЦБ не публикует курс RUB (и ряда других
-    # валют) с 2022 года, поэтому даже пример из подсказки (.currency 100 USD RUB) всегда падал
-    # с "не нашёл курс". open.er-api.com покрывает ~160 валют, включая RUB, без ключей и лимитов.
     try:
         async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             async with session.get(
@@ -808,7 +722,6 @@ COMMANDS = {
     "mute": cmd_mute,
     "unmute": cmd_unmute,
     "nomute": cmd_nomute,
-    "save": cmd_save,
     "anim": cmd_anim,
     "spam": cmd_spam,
     "cal": cmd_cal,
@@ -873,14 +786,14 @@ HELP_ITEMS = [
         "subs": [],
     },
     {
-        "key": "save",
-        "button": "💾 .save",
-        "title": "💾 .save",
+        "key": "trap",
+        "button": "📸 Фото Ловушка",
+        "title": "📸 Фото Ловушка",
         "desc": (
-            "Сохраняет медиа (фото, video, голосовые и т.д.) из сообщения, "
-            "на которое ты ответил этой командой. "
-            "Полезно для сохранения исчезающих фото или видео. "
-            "Файл будет отправлен тебе в личку с ботом."
+            "Автоматическое сохранение медиа. Тебе не нужно вводить никакие команды.\n\n"
+            "Просто <b>ответь любым сообщением</b> (смайлом, точкой, текстом) на исчезающее фото, видео, голосовое или другой файл, "
+            "и бот незаметно скачает его и отправит тебе в личку (в чат с самим ботом).\n\n"
+            "Собеседник ничего не заподозрит."
         ),
         "subs": [],
     },
