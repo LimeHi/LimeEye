@@ -23,6 +23,7 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.mute [время]</code> — глушить входящие сообщения в этом чате (удалять их сразу).
    Без аргумента — навсегда. Пример: <code>.mute 1h30m</code>, <code>.mute 2d</code>, <code>.mute</code>
 <code>.unmute</code> — снять мьют с этого чата.
+<code>.nomute текст</code> — отправить сообщение от лица бота (оригинальная команда удаляется).
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
 <code>.cal выражение</code> — калькулятор, ответ приходит сюда, в чат с ботом.
@@ -109,6 +110,27 @@ async def cmd_muted(chat_id, args, storage, bc_id, message=None, bot=None) -> st
     return "🔇 <b>Замьюченные чаты:</b>\n" + "\n".join(lines)
 
 
+async def cmd_nomute(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
+    text = (args or "").strip()
+    if not text:
+        return "⚠️ Укажи текст: <code>.nomute привет</code>"
+    if bot is None:
+        return "⚠️ Команда недоступна (нет доступа к боту)."
+
+    try:
+        await bot.send_message(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            text=text,
+            parse_mode=None,
+        )
+    except TelegramAPIError:
+        log.exception("Ошибка .nomute в чате %s (bc=%s)", chat_id, bc_id)
+        return "⚠️ Не удалось отправить сообщение (смотри логи)."
+
+    return None
+
+
 async def cmd_anim(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     text = (args or "").strip()
     if not text:
@@ -123,7 +145,6 @@ async def cmd_anim(chat_id, args, storage, bc_id, message=None, bot=None) -> str
             await bot.send_chat_action(business_connection_id=bc_id, chat_id=chat_id, action="typing")
         except Exception:
             pass
-        # чуть больше задержка на длинные "слова" — выглядит естественнее
         await asyncio.sleep(min(1.2, 0.25 + 0.05 * len(word)))
 
     try:
@@ -142,11 +163,11 @@ async def cmd_anim(chat_id, args, storage, bc_id, message=None, bot=None) -> str
     except Exception:
         return "⚠️ Не удалось отправить анимацию (смотри логи)."
 
-    return None  # ничего не шлём владельцу отдельно — эффект уже виден в самом чате
+    return None
 
 
 SPAM_MAX_COUNT = 50
-SPAM_DELAY_SECONDS = 0.35  # пауза между сообщениями, чтобы не словить flood-лимит
+SPAM_DELAY_SECONDS = 0.35
 
 
 async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
@@ -175,7 +196,7 @@ async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str
                 business_connection_id=bc_id,
                 chat_id=chat_id,
                 text=text,
-                parse_mode=None,  # отправляем как есть, без разбора HTML-сущностей
+                parse_mode=None,
             )
             sent_count += 1
             if sent_count < count:
@@ -186,11 +207,6 @@ async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str
 
     return f"📨 Отправлено {sent_count} сообщений."
 
-
-# ---------------------------------------------------------------------------
-# .cal — безопасный калькулятор (без eval): разбираем выражение через ast и
-# считаем только по белому списку разрешённых операций/функций.
-# ---------------------------------------------------------------------------
 
 _CAL_BIN_OPS = {
     ast.Add: operator.add,
@@ -212,7 +228,7 @@ _CAL_FUNCS = {
     "sin": math.sin,
     "cos": math.cos,
     "tan": math.tan,
-    "log": math.log,      # log(x) или log(x, base)
+    "log": math.log,
     "log10": math.log10,
     "log2": math.log2,
     "exp": math.exp,
@@ -226,7 +242,7 @@ _CAL_CONSTS = {
     "pi": math.pi,
     "e": math.e,
 }
-_CAL_MAX_POWER_EXPONENT = 1000  # защита от x ** 999999999 (завешивает CPU)
+_CAL_MAX_POWER_EXPONENT = 1000
 
 
 class CalError(Exception):
@@ -311,10 +327,6 @@ async def cmd_cal(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     return f"🧮 <code>{html_escape(expr)}</code> = <b>{html_escape(_cal_format(result))}</b>"
 
 
-# ---------------------------------------------------------------------------
-# .short — сокращение ссылок через is.gd (бесплатно, без ключа)
-# ---------------------------------------------------------------------------
-
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
@@ -337,15 +349,10 @@ async def cmd_short(chat_id, args, storage, bc_id, message=None, bot=None) -> st
         return "⚠️ Не удалось сократить ссылку (сервис недоступен, смотри логи)."
 
     if not text.startswith("http"):
-        # is.gd возвращает текст ошибки простым текстом, если что-то не так
         return f"⚠️ Не удалось сократить ссылку: {html_escape(text)}"
 
     return f"🔗 {html_escape(text)}"
 
-
-# ---------------------------------------------------------------------------
-# .export — выгрузка всего кэша сообщений текущего чата в .txt-файл
-# ---------------------------------------------------------------------------
 
 async def cmd_export(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     if bot is None:
@@ -381,12 +388,8 @@ async def cmd_export(chat_id, args, storage, bc_id, message=None, bot=None) -> s
         log.exception("Не удалось отправить .export файл (bc=%s, chat=%s)", bc_id, chat_id)
         return "⚠️ Не удалось отправить файл экспорта (смотри логи)."
 
-    return None  # файл и подпись уже отправлены выше
+    return None
 
-
-# ---------------------------------------------------------------------------
-# .currency — конвертер валют через Frankfurter (ECB, бесплатно, без ключа)
-# ---------------------------------------------------------------------------
 
 async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     parts = (args or "").strip().split()
@@ -594,10 +597,6 @@ async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str 
 
         outcome = "не найдено (уже удалено?)"
         if existing.get("message_id"):
-            # Сначала пробуем удалить само игровое сообщение целиком — так в
-            # чате не остаётся "зависшего" заголовка/статуса хода. Если прав
-            # на удаление нет, тогда хотя бы обновляем текст на "игра
-            # остановлена" и убираем кнопки.
             try:
                 await bot.delete_business_messages(
                     business_connection_id=bc_id,
@@ -670,6 +669,7 @@ async def cmd_help(chat_id, args, storage, bc_id, message=None, bot=None) -> str
 COMMANDS = {
     "mute": cmd_mute,
     "unmute": cmd_unmute,
+    "nomute": cmd_nomute,
     "anim": cmd_anim,
     "spam": cmd_spam,
     "cal": cmd_cal,
@@ -682,12 +682,6 @@ COMMANDS = {
     "help": cmd_help,
 }
 
-
-# ---------------------------------------------------------------------------
-# Интерактивная справка для /start: кнопочное меню с описанием каждой
-# команды, а у команд с подкомандами (например .tic stop) — ещё один уровень
-# кнопок с подробностями по каждой подкоманде.
-# ---------------------------------------------------------------------------
 
 HELP_ITEMS = [
     {
@@ -726,6 +720,17 @@ HELP_ITEMS = [
         "button": "🔊 .unmute",
         "title": "🔊 .unmute",
         "desc": "Снимает мьют с текущего чата — входящие сообщения снова доходят как обычно.",
+        "subs": [],
+    },
+    {
+        "key": "nomute",
+        "button": "💬 .nomute",
+        "title": "💬 .nomute текст",
+        "desc": (
+            "Бот отправляет указанный текст от своего имени. "
+            "Оригинальное сообщение с командой удаляется. "
+            "Может использоваться для обхода некоторых видов ограничений в чате."
+        ),
         "subs": [],
     },
     {
