@@ -202,6 +202,22 @@ class Storage:
         )
         await self._db.commit()
 
+    async def export_chat_cache(self, business_connection_id, chat_id):
+        """Все закэшированные сообщения чата, от старых к новым — для .export."""
+        cur = await self._db.execute(
+            "SELECT business_connection_id, chat_id, msg_id, sender_id, sender_name, "
+            "sender_username, chat_name, chat_username, text, media_type, media_kind, "
+            "media_file_id, date "
+            "FROM messages_cache WHERE business_connection_id = ? AND chat_id = ? "
+            "ORDER BY date ASC, msg_id ASC",
+            (business_connection_id, chat_id),
+        )
+        rows = await cur.fetchall()
+        keys = ["business_connection_id", "chat_id", "msg_id", "sender_id", "sender_name",
+                "sender_username", "chat_name", "chat_username", "text", "media_type",
+                "media_kind", "media_file_id", "date"]
+        return [dict(zip(keys, row)) for row in rows]
+
     async def purge_old_cache(self, max_age_seconds: int) -> int:
         """Удаляет из кэша сообщения старше max_age_seconds. Возвращает число
         удалённых строк — вызывается периодически вместо ручной .clean."""

@@ -17,4 +17,4 @@ CACHE_LIMIT_PER_CHAT = int(os.environ.get("CACHE_LIMIT_PER_CHAT", "500"))
 
 # Сколько дней хранить сообщения в кэше, прежде чем удалить автоматически
 # (кэш нужен только для save/edit-отчётов "по горячим следам")
-CACHE_MAX_AGE_DAYS = float(os.environ.get("CACHE_MAX_AGE_DAYS", "3"))
+CACHE_MAX_AGE_DAYS = float(os.environ.get("CACHE_MAX_AGE_DAYS", "1"))

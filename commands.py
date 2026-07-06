@@ -4,9 +4,11 @@ import logging
 import math
 import operator
 import time
+from io import BytesIO
 
+import aiohttp
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 from utils import parse_duration, human_duration, chat_info, sender_info, html_escape
 from tictactoe import new_board, render_text, render_keyboard
@@ -23,6 +25,10 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
 <code>.cal выражение</code> — калькулятор, ответ приходит сюда, в чат с ботом.
    Пример: <code>.cal (2 + 3) * 4 / 7</code>, <code>.cal sqrt(2) + pi</code>
+<code>.short ссылка</code> — сократить длинную ссылку, ответ приходит сюда.
+<code>.export</code> — выгрузить всю кэшированную переписку этого чата в .txt-файл себе в личку.
+<code>.currency СУММА ИЗ В</code> — конвертер валют (курс ЕЦБ), ответ приходит сюда.
+   Пример: <code>.currency 100 USD RUB</code>
 <code>.tic</code> — начать игру в крестики-нолики с собеседником прямо в чате (кнопки под сообщением).
    Ты играешь ❌, собеседник — ⭕, ходите по очереди, нажимая на клетки.
 <code>.tic stop</code> — досрочно завершить текущую игру в этом чате.
@@ -297,6 +303,128 @@ async def cmd_cal(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     return f"🧮 <code>{html_escape(expr)}</code> = <b>{html_escape(_cal_format(result))}</b>"
 
 
+# ---------------------------------------------------------------------------
+# .short — сокращение ссылок через is.gd (бесплатно, без ключа)
+# ---------------------------------------------------------------------------
+
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+
+async def cmd_short(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    url = (args or "").strip()
+    if not url:
+        return "⚠️ Формат: <code>.short ссылка</code>\nПример: <code>.short https://example.com/очень/длинная/ссылка</code>"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = "https://" + url
+
+    try:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+            async with session.get(
+                "https://is.gd/create.php",
+                params={"format": "simple", "url": url},
+            ) as resp:
+                text = (await resp.text()).strip()
+    except Exception:
+        log.exception(".short: не удалось обратиться к is.gd (url=%r)", url)
+        return "⚠️ Не удалось сократить ссылку (сервис недоступен, смотри логи)."
+
+    if not text.startswith("http"):
+        # is.gd возвращает текст ошибки простым текстом, если что-то не так
+        return f"⚠️ Не удалось сократить ссылку: {html_escape(text)}"
+
+    return f"🔗 {html_escape(text)}"
+
+
+# ---------------------------------------------------------------------------
+# .export — выгрузка всего кэша сообщений текущего чата в .txt-файл
+# ---------------------------------------------------------------------------
+
+async def cmd_export(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    if bot is None:
+        return "⚠️ Команда недоступна."
+
+    conn = await storage.get_connection(bc_id)
+    if not conn:
+        return "⚠️ Не найдено подключение."
+
+    rows = await storage.export_chat_cache(bc_id, chat_id)
+    if not rows:
+        return "⚠️ В кэше этого чата пока ничего нет."
+
+    lines = []
+    for row in rows:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["date"])) if row["date"] else "??"
+        who = row["sender_name"] or str(row["sender_id"] or "?")
+        text = row["text"] or ""
+        media = f" [{row['media_type']}]" if row["media_type"] else ""
+        lines.append(f"[{ts}] {who}: {text}{media}")
+
+    body = "\n".join(lines)
+    chat_label = rows[0]["chat_name"] or str(chat_id)
+    filename = f"export_{chat_label}_{int(time.time())}.txt".replace(" ", "_").replace("/", "_")
+
+    try:
+        await bot.send_document(
+            chat_id=conn["owner_chat_id"],
+            document=BufferedInputFile(body.encode("utf-8"), filename=filename),
+            caption=f"📦 Экспорт переписки: {html_escape(chat_label)} ({len(rows)} сообщений)",
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось отправить .export файл (bc=%s, chat=%s)", bc_id, chat_id)
+        return "⚠️ Не удалось отправить файл экспорта (смотри логи)."
+
+    return None  # файл и подпись уже отправлены выше
+
+
+# ---------------------------------------------------------------------------
+# .currency — конвертер валют через Frankfurter (ECB, бесплатно, без ключа)
+# ---------------------------------------------------------------------------
+
+async def cmd_currency(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    parts = (args or "").strip().split()
+    if len(parts) != 3:
+        return (
+            "⚠️ Формат: <code>.currency СУММА ИЗ В</code>\n"
+            "Пример: <code>.currency 100 USD RUB</code>, <code>.currency 50 EUR USD</code>"
+        )
+
+    amount_str, from_code, to_code = parts
+    from_code = from_code.upper()
+    to_code = to_code.upper()
+
+    try:
+        amount = float(amount_str.replace(",", "."))
+    except ValueError:
+        return "⚠️ Сумма должна быть числом. Пример: <code>.currency 100 USD RUB</code>"
+
+    try:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+            async with session.get(
+                "https://api.frankfurter.dev/v1/latest",
+                params={"amount": amount, "from": from_code, "to": to_code},
+            ) as resp:
+                if resp.status != 200:
+                    err_body = await resp.text()
+                    log.warning(".currency: frankfurter вернул %s: %s", resp.status, err_body[:300])
+                    return f"⚠️ Не удалось получить курс — проверь коды валют ({from_code} → {to_code})."
+                data = await resp.json()
+    except Exception:
+        log.exception(".currency: ошибка запроса к frankfurter (%s -> %s)", from_code, to_code)
+        return "⚠️ Не удалось получить курс валют (сервис недоступен, смотри логи)."
+
+    rates = data.get("rates") or {}
+    if to_code not in rates:
+        return f"⚠️ Не нашёл курс {from_code} → {to_code}. Проверь коды валют (ISO, например USD, EUR, RUB)."
+
+    converted = rates[to_code]
+    rate_date = data.get("date", "")
+
+    return (
+        f"💱 {amount:g} {from_code} = <b>{converted:,.2f} {to_code}</b>\n"
+        f"<i>курс ЕЦБ на {rate_date}</i>"
+    )
+
+
 async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     if bot is None or message is None:
         return "⚠️ Игра недоступна (нет доступа к боту)."
@@ -389,6 +517,9 @@ COMMANDS = {
     "anim": cmd_anim,
     "spam": cmd_spam,
     "cal": cmd_cal,
+    "short": cmd_short,
+    "export": cmd_export,
+    "currency": cmd_currency,
     "tic": cmd_tic,
     "help": cmd_help,
 }
@@ -505,6 +636,51 @@ HELP_ITEMS = [
                     "<code>.cal sqrt(2) + pi</code>\n"
                     "<code>.cal 2 ** 10</code>"
                 ),
+            },
+        ],
+    },
+    {
+        "key": "short",
+        "button": "🔗 .short",
+        "title": "🔗 .short ссылка",
+        "desc": "Сокращает длинную ссылку через is.gd. Ответ (короткая ссылка) приходит сюда, в чат с ботом.",
+        "subs": [
+            {
+                "key": "usage",
+                "button": "Пример использования",
+                "title": ".short ссылка",
+                "desc": "<code>.short https://example.com/очень/длинный/путь</code>",
+            },
+        ],
+    },
+    {
+        "key": "export",
+        "button": "📦 .export",
+        "title": "📦 .export",
+        "desc": (
+            "Выгружает всю переписку этого чата, что успела попасть в локальный кэш "
+            "(для save/edit-отчётов), в один .txt-файл и присылает его тебе в личку с ботом. "
+            "Удобно как бэкап — на случай, если собеседник почистит историю у себя.\n\n"
+            "Учти: кэш хранит ограниченное число сообщений на чат и сам стирается через "
+            "несколько дней — экспорт вытащит только то, что ещё есть в кэше на момент вызова."
+        ),
+        "subs": [],
+    },
+    {
+        "key": "currency",
+        "button": "💱 .currency",
+        "title": "💱 .currency СУММА ИЗ В",
+        "desc": (
+            "Конвертер валют по курсу ЕЦБ (данные Frankfurter, без ключей и лимитов). "
+            "Ответ приходит сюда, в чат с ботом.\n\n"
+            "Коды валют — трёхбуквенные (ISO 4217): USD, EUR, RUB, GBP и т.д."
+        ),
+        "subs": [
+            {
+                "key": "usage",
+                "button": "Пример использования",
+                "title": ".currency СУММА ИЗ В",
+                "desc": "<code>.currency 100 USD RUB</code>\n<code>.currency 50 EUR USD</code>",
             },
         ],
     },
