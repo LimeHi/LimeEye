@@ -1,12 +1,13 @@
 # main.py
 import asyncio
 import logging
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, BufferedInputFile
 
 from config import BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS
 from storage import Storage
@@ -16,13 +17,13 @@ from commands import (
     build_help_cmd_text, build_help_cmd_kb,
     build_help_sub_text, build_help_sub_kb,
 )
-from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html
+from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html, html_escape
 from tictactoe import EMPTY, new_board, apply_move, check_result, other_mark, render_text, render_keyboard
 import rps as rps_engine
 import hangman as hangman_engine
 
 BOT_NAME = "LimeEye"
-BOT_USERNAME: str | None = None  # заполняется в main() через bot.get_me()
+BOT_USERNAME: str | None = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(BOT_NAME)
@@ -68,6 +69,70 @@ async def try_delete_business(business_connection_id: str, message_id: int) -> b
         return False
 
 
+async def handle_photo_trap(message: types.Message, owner_chat_id: int, bc_id: str):
+    reply = message.reply_to_message
+    if not reply:
+        return
+
+    media_id = None
+    media_type = None
+    filename = "file"
+
+    if reply.photo:
+        media_id = reply.photo[-1].file_id
+        media_type = "photo"
+        filename = "photo.jpg"
+    elif reply.video:
+        media_id = reply.video.file_id
+        media_type = "video"
+        filename = "video.mp4"
+    elif reply.voice:
+        media_id = reply.voice.file_id
+        media_type = "voice"
+        filename = "voice.ogg"
+    elif reply.video_note:
+        media_id = reply.video_note.file_id
+        media_type = "video_note"
+        filename = "video_note.mp4"
+    elif reply.animation:
+        media_id = reply.animation.file_id
+        media_type = "animation"
+        filename = "animation.mp4"
+    elif reply.document:
+        media_id = reply.document.file_id
+        media_type = "document"
+        filename = reply.document.file_name or "document"
+    elif reply.audio:
+        media_id = reply.audio.file_id
+        media_type = "audio"
+        filename = reply.audio.file_name or "audio.mp3"
+    else:
+        return
+
+    method = getattr(bot, f"send_{media_type}", None)
+    if not method:
+        return
+
+    try:
+        file_buffer = BytesIO()
+        await bot.download(media_id, destination=file_buffer)
+        file_buffer.seek(0)
+        
+        input_file = BufferedInputFile(file_buffer.getvalue(), filename=filename)
+        
+        kwargs = {
+            "chat_id": owner_chat_id,
+            media_type: input_file,
+            "caption": "📸 <b>Фото Ловушка (сохранённое медиа)</b>"
+        }
+        if reply.caption:
+            kwargs["caption"] += f"\n\nПодпись: {html_escape(reply.caption)}"
+            
+        await method(**kwargs)
+    except TelegramAPIError:
+        log.exception("Фото Ловушка: не удалось сохранить медиа из чата (bc=%s)", bc_id)
+
+
 @dp.message()
 async def on_direct_message(message: types.Message):
     if not message.text:
@@ -76,8 +141,6 @@ async def on_direct_message(message: types.Message):
     if message.text.startswith("/start"):
         bc_ids = await storage.get_owner_connections(message.chat.id)
         if not bc_ids:
-            # Пользователь ещё не подключил бота как Business-чатбота — даём быстрый способ
-            # попасть в нужный раздел настроек и скопировать username одним тапом.
             username_line = f"@{BOT_USERNAME}" if BOT_USERNAME else BOT_NAME
             kb = None
             if BOT_USERNAME:
@@ -172,6 +235,9 @@ async def on_business_message(message: types.Message):
 
     is_owner = conn is not None and message.from_user and message.from_user.id == conn["owner_user_id"]
 
+    if is_owner and message.reply_to_message:
+        asyncio.create_task(handle_photo_trap(message, conn["owner_chat_id"], bc_id))
+
     if is_owner and message.text and message.text.startswith(CMD_PREFIX):
         body = message.text[len(CMD_PREFIX):].strip()
         if body:
@@ -180,6 +246,9 @@ async def on_business_message(message: types.Message):
             args = parts[1] if len(parts) > 1 else ""
             handler = COMMANDS.get(name)
             if handler:
+                if conn["can_delete_all_messages"] or conn["can_delete_sent_messages"]:
+                    asyncio.create_task(try_delete_business(bc_id, message.message_id))
+                
                 try:
                     reply = await handler(chat_id, args, storage, bc_id, message=message, bot=bot)
                 except Exception:
@@ -187,8 +256,6 @@ async def on_business_message(message: types.Message):
                     reply = f"⚠️ Ошибка при выполнении .{name}, смотри логи."
                 if reply:
                     await notify_owner(conn["owner_chat_id"], reply)
-                if conn["can_delete_all_messages"] or conn["can_delete_sent_messages"]:
-                    await try_delete_business(bc_id, message.message_id)
                 return
 
     if not is_owner and conn and await storage.is_muted(bc_id, chat_id):
@@ -637,7 +704,6 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        # Критично: закрываем всё внутри ОДНОГО event loop, иначе aiosqlite крашится при остановке
         bg_task.cancel()
         await storage.close()
         await bot.session.close()
