@@ -9,7 +9,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand, BufferedInputFile
 
-from config import BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS
+from config import BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS, CHANNEL_USERNAME
 from storage import Storage
 from commands import (
     COMMANDS, cmd_muted, HELP_TEXT,
@@ -133,10 +133,53 @@ async def handle_photo_trap(message: types.Message, owner_chat_id: int, bc_id: s
         log.exception("Фото Ловушка: не удалось сохранить медиа из чата (bc=%s)", bc_id)
 
 
+SUBSCRIBE_TEXT = (
+    "🔒 Чтобы пользоваться ботом, подпишись на наш канал:\n"
+    f"👉 @{CHANNEL_USERNAME}\n\n"
+    "После подписки нажми кнопку «✅ Я подписался» ниже."
+)
+
+
+def build_subscribe_kb() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME}")],
+        [types.InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
+    ])
+
+
+async def is_subscribed(user_id: int) -> bool:
+    if not CHANNEL_USERNAME:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
+        return member.status not in ("left", "kicked")
+    except TelegramAPIError:
+        # Бот не смог проверить подписку (например, не админ канала) — не блокируем пользователя.
+        log.exception("Не удалось проверить подписку на канал @%s для user_id=%s", CHANNEL_USERNAME, user_id)
+        return True
+
+
+@dp.callback_query(F.data == "check_sub")
+async def on_check_sub(callback: types.CallbackQuery):
+    if await is_subscribed(callback.from_user.id):
+        await callback.answer("✅ Подписка подтверждена, спасибо!", show_alert=True)
+        try:
+            await callback.message.delete()
+        except TelegramAPIError:
+            pass
+    else:
+        await callback.answer("❌ Пока не вижу подписки. Подпишись и попробуй снова.", show_alert=True)
+
+
 @dp.message()
 async def on_direct_message(message: types.Message):
     if not message.text:
         return
+
+    if CHANNEL_USERNAME and message.text.startswith(("/start", "/help", "/muted", "/hangman")):
+        if not await is_subscribed(message.from_user.id):
+            await message.answer(SUBSCRIBE_TEXT, reply_markup=build_subscribe_kb())
+            return
 
     if message.text.startswith("/start"):
         bc_ids = await storage.get_owner_connections(message.chat.id)

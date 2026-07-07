@@ -198,7 +198,7 @@ SPAM_MAX_COUNT = 50
 SPAM_DELAY_SECONDS = 0.35
 
 
-async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str | None:
     if bot is None:
         return "⚠️ Команда недоступна (нет доступа к боту)."
 
@@ -235,7 +235,7 @@ async def cmd_spam(chat_id, args, storage, bc_id, message=None, bot=None) -> str
             return f"⚠️ Отправлено {sent_count} из {count}.\n\n{_BUSINESS_PEER_INVALID_HINT}"
         return f"⚠️ Отправлено {sent_count} из {count} — дальше упёрлось в ошибку (смотри логи)."
 
-    return f"📨 Отправлено {sent_count} сообщений."
+    return None
 
 
 _CAL_BIN_OPS = {
