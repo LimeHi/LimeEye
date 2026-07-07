@@ -113,16 +113,20 @@ async def cmd_unmute(chat_id, args, storage, bc_id, message=None, bot=None) -> s
 
 async def cmd_muted(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     rows = await storage.list_muted(bc_id)
-    if not rows:
-        return "Замьюченных чатов нет."
     lines = []
     for muted_chat_id, until_ts, chat_name, chat_username in rows:
         label = _muted_row_label(muted_chat_id, chat_name, chat_username)
         if until_ts:
-            remaining = max(0, int(until_ts - time.time()))
+            remaining = int(until_ts - time.time())
+            if remaining <= 0:
+                # срок истёк — снимаем мьют вместо показа "осталось 0s"
+                await storage.unmute_chat(bc_id, muted_chat_id)
+                continue
             lines.append(f"• {label} — ещё {human_duration(remaining)}")
         else:
             lines.append(f"• {label} — навсегда")
+    if not lines:
+        return "Замьюченных чатов нет."
     return "🔇 <b>Замьюченные чаты:</b>\n" + "\n".join(lines)
 
 
