@@ -391,8 +391,9 @@ async def on_edited_business_message(message: types.Message):
     cached = await storage.get_cached(bc_id, chat_id, message.message_id)
     old_text = cached["text"] if cached else None
     new_text = message.text or message.caption or ""
+    is_own_message = cached is not None and cached["sender_id"] == conn["owner_user_id"]
 
-    if old_text is not None and old_text != new_text:
+    if not is_own_message and old_text is not None and old_text != new_text:
         who = mention_html(cached["sender_id"], cached["sender_name"], cached["sender_username"])
         report = (
             f"✏️ <b>Изменённое сообщение</b>\n"
@@ -433,6 +434,8 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     for msg_id in event.message_ids:
         cached = await storage.get_cached(bc_id, chat_id, msg_id)
         if not cached:
+            continue
+        if cached["sender_id"] == conn["owner_user_id"]:
             continue
         who = mention_html(cached["sender_id"], cached["sender_name"], cached["sender_username"])
         media = f"\n{cached['media_type']}" if cached["media_type"] else ""
