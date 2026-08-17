@@ -44,12 +44,28 @@ CREATE TABLE IF NOT EXISTS connections (
     business_connection_id TEXT PRIMARY KEY,
     owner_user_id INTEGER,
     owner_chat_id INTEGER,     -- личный чат бота с владельцем (для отчётов/ответов на команды)
+    owner_name TEXT,
+    owner_username TEXT,
     can_reply INTEGER,
     can_read_messages INTEGER,
     can_delete_sent_messages INTEGER,
     can_delete_all_messages INTEGER,
     is_enabled INTEGER,
+    created_at INTEGER,
     updated_at INTEGER
+);
+
+-- Каждый уникальный пользователь, когда-либо нажавший /start в личке с ботом
+-- (независимо от того, подключил он потом Business-аккаунт или нет).
+-- Нужно только для админской статистики "сколько людей зашли в бота".
+CREATE TABLE IF NOT EXISTS bot_users (
+    user_id INTEGER PRIMARY KEY,
+    chat_id INTEGER,
+    name TEXT,
+    username TEXT,
+    first_seen INTEGER,
+    last_seen INTEGER,
+    starts_count INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS messages_cache (
@@ -139,6 +155,9 @@ MIGRATIONS = [
     ("muted_chats", "chat_username", "TEXT"),
     ("messages_cache", "media_kind", "TEXT"),
     ("messages_cache", "media_file_id", "TEXT"),
+    ("connections", "owner_name", "TEXT"),
+    ("connections", "owner_username", "TEXT"),
+    ("connections", "created_at", "INTEGER"),
 ]
 
 
@@ -169,16 +188,20 @@ class Storage:
 
     async def upsert_connection(self, business_connection_id, owner_user_id, owner_chat_id,
                                  can_reply, can_read_messages, can_delete_sent_messages,
-                                 can_delete_all_messages, is_enabled):
+                                 can_delete_all_messages, is_enabled,
+                                 owner_name=None, owner_username=None):
+        now = int(time.time())
         await self._db.execute(
             """INSERT INTO connections
-               (business_connection_id, owner_user_id, owner_chat_id, can_reply,
-                can_read_messages, can_delete_sent_messages, can_delete_all_messages,
-                is_enabled, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               (business_connection_id, owner_user_id, owner_chat_id, owner_name, owner_username,
+                can_reply, can_read_messages, can_delete_sent_messages, can_delete_all_messages,
+                is_enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(business_connection_id) DO UPDATE SET
                  owner_user_id=excluded.owner_user_id,
                  owner_chat_id=excluded.owner_chat_id,
+                 owner_name=excluded.owner_name,
+                 owner_username=excluded.owner_username,
                  can_reply=excluded.can_reply,
                  can_read_messages=excluded.can_read_messages,
                  can_delete_sent_messages=excluded.can_delete_sent_messages,
@@ -186,9 +209,9 @@ class Storage:
                  is_enabled=excluded.is_enabled,
                  updated_at=excluded.updated_at
             """,
-            (business_connection_id, owner_user_id, owner_chat_id, int(can_reply),
-             int(can_read_messages), int(can_delete_sent_messages), int(can_delete_all_messages),
-             int(is_enabled), int(time.time())),
+            (business_connection_id, owner_user_id, owner_chat_id, _enc(owner_name), _enc(owner_username),
+             int(can_reply), int(can_read_messages), int(can_delete_sent_messages),
+             int(can_delete_all_messages), int(is_enabled), now, now),
         )
         await self._db.commit()
 
@@ -361,6 +384,83 @@ class Storage:
         )
         rows = await cur.fetchall()
         return [row[0] for row in rows]
+
+    # ---------- пользователи бота (/start) и админ-статистика ----------
+
+    async def touch_user(self, user_id, chat_id, name, username):
+        """Регистрирует /start пользователя: первый визит — insert, повторный — счётчик+1."""
+        now = int(time.time())
+        await self._db.execute(
+            """INSERT INTO bot_users (user_id, chat_id, name, username, first_seen, last_seen, starts_count)
+               VALUES (?, ?, ?, ?, ?, ?, 1)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 chat_id=excluded.chat_id,
+                 name=excluded.name,
+                 username=excluded.username,
+                 last_seen=excluded.last_seen,
+                 starts_count=starts_count + 1
+            """,
+            (user_id, chat_id, _enc(name), _enc(username), now, now),
+        )
+        await self._db.commit()
+
+    async def count_users(self) -> int:
+        cur = await self._db.execute("SELECT COUNT(*) FROM bot_users")
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def count_connections(self):
+        """Возвращает (всего_когда-либо_подключений, сейчас_активных)."""
+        cur = await self._db.execute("SELECT COUNT(*), COALESCE(SUM(is_enabled), 0) FROM connections")
+        row = await cur.fetchone()
+        return (row[0] or 0, row[1] or 0)
+
+    async def list_connections(self, limit: int = 30, only_enabled: bool = False):
+        """Последние подключения Business-аккаунта, для админ-панели."""
+        where = "WHERE is_enabled = 1" if only_enabled else ""
+        cur = await self._db.execute(
+            f"""SELECT owner_user_id, owner_name, owner_username, is_enabled,
+                       can_delete_all_messages, created_at, updated_at
+                FROM connections {where}
+                ORDER BY updated_at DESC
+                LIMIT ?""",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        result = []
+        for owner_user_id, owner_name, owner_username, is_enabled, can_delete_all, created_at, updated_at in rows:
+            result.append({
+                "owner_user_id": owner_user_id,
+                "owner_name": _dec(owner_name),
+                "owner_username": _dec(owner_username),
+                "is_enabled": bool(is_enabled),
+                "can_delete_all_messages": bool(can_delete_all),
+                "created_at": created_at,
+                "updated_at": updated_at,
+            })
+        return result
+
+    async def list_recent_users(self, limit: int = 30):
+        """Последние пользователи, нажимавшие /start, для админ-панели."""
+        cur = await self._db.execute(
+            """SELECT user_id, name, username, first_seen, last_seen, starts_count
+               FROM bot_users
+               ORDER BY last_seen DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        result = []
+        for user_id, name, username, first_seen, last_seen, starts_count in rows:
+            result.append({
+                "user_id": user_id,
+                "name": _dec(name),
+                "username": _dec(username),
+                "first_seen": first_seen,
+                "last_seen": last_seen,
+                "starts_count": starts_count,
+            })
+        return result
 
     # ---------- крестики-нолики ----------
 

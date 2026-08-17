@@ -9,7 +9,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand, BufferedInputFile
 
-from config import BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS, CHANNEL_USERNAME
+from config import BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS, CHANNEL_USERNAME, ADMIN_ID
 from storage import Storage
 from commands import (
     COMMANDS, cmd_muted, HELP_TEXT,
@@ -171,6 +171,70 @@ async def on_check_sub(callback: types.CallbackQuery):
         await callback.answer("❌ Пока не вижу подписки. Подпишись и попробуй снова.", show_alert=True)
 
 
+def _fmt_ts(ts: int | None) -> str:
+    if not ts:
+        return "—"
+    from datetime import datetime
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+
+
+def _fmt_user(user_id, name, username) -> str:
+    label = html_escape(name) if name else "без имени"
+    if username:
+        label += f" (@{html_escape(username)})"
+    return f"{label} — <code>{user_id}</code>"
+
+
+async def cmd_admin(message: types.Message):
+    if ADMIN_ID is None or message.from_user is None or message.from_user.id != ADMIN_ID:
+        # Не выдаём существование команды посторонним — просто игнорируем.
+        return
+
+    users_total = await storage.count_users()
+    conns_total, conns_active = await storage.count_connections()
+
+    lines = [
+        f"👑 <b>Админ-панель {BOT_NAME}</b>",
+        "",
+        f"👥 Всего заходило в бота (уникальных /start): <b>{users_total}</b>",
+        f"🔌 Подключений Business-аккаунта: <b>{conns_active}</b> активно / "
+        f"<b>{conns_total}</b> всего за всё время",
+        "",
+        "🕒 <b>Последние подключившие бота к себе:</b>",
+    ]
+
+    connections = await storage.list_connections(limit=20)
+    if not connections:
+        lines.append("— пока никто не подключал.")
+    else:
+        for c in connections:
+            status = "✅" if c["is_enabled"] else "🔌 отключено"
+            delete_note = "" if c["can_delete_all_messages"] else " (нет права удаления)"
+            lines.append(
+                f"• {_fmt_user(c['owner_user_id'], c['owner_name'], c['owner_username'])}\n"
+                f"   {status}{delete_note}, обновлено {_fmt_ts(c['updated_at'])}"
+            )
+
+    lines.append("")
+    lines.append("🆕 <b>Последние заходившие (/start):</b>")
+    recent_users = await storage.list_recent_users(limit=20)
+    if not recent_users:
+        lines.append("— пока никто не заходил.")
+    else:
+        for u in recent_users:
+            lines.append(
+                f"• {_fmt_user(u['user_id'], u['name'], u['username'])} — "
+                f"{u['starts_count']}x, последний раз {_fmt_ts(u['last_seen'])}"
+            )
+
+    text = "\n".join(lines)
+    # Telegram режет сообщения на ~4096 символов — на случай большого списка подстрахуемся.
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n…список обрезан, слишком много записей."
+
+    await message.answer(text, disable_web_page_preview=True)
+
+
 @dp.message()
 async def on_direct_message(message: types.Message):
     if not message.text:
@@ -182,6 +246,17 @@ async def on_direct_message(message: types.Message):
             return
 
     if message.text.startswith("/start"):
+        if message.from_user is not None:
+            full_name = message.from_user.first_name or ""
+            if message.from_user.last_name:
+                full_name = f"{full_name} {message.from_user.last_name}".strip()
+            await storage.touch_user(
+                user_id=message.from_user.id,
+                chat_id=message.chat.id,
+                name=full_name or None,
+                username=message.from_user.username,
+            )
+
         bc_ids = await storage.get_owner_connections(message.chat.id)
         if not bc_ids:
             username_line = f"@{BOT_USERNAME}" if BOT_USERNAME else BOT_NAME
@@ -282,6 +357,10 @@ async def on_direct_message(message: types.Message):
         )
         return
 
+    if message.text.startswith(("/admin", "админ")):
+        await cmd_admin(message)
+        return
+
 
 @dp.business_connection()
 async def on_business_connection(bc: types.BusinessConnection):
@@ -294,6 +373,10 @@ async def on_business_connection(bc: types.BusinessConnection):
     )
     can_delete_all = bool(getattr(rights, "can_delete_all_messages", False))
 
+    owner_name = bc.user.first_name or ""
+    if bc.user.last_name:
+        owner_name = f"{owner_name} {bc.user.last_name}".strip()
+
     await storage.upsert_connection(
         business_connection_id=bc.id,
         owner_user_id=bc.user.id,
@@ -303,6 +386,8 @@ async def on_business_connection(bc: types.BusinessConnection):
         can_delete_sent_messages=can_delete_sent,
         can_delete_all_messages=can_delete_all,
         is_enabled=bc.is_enabled,
+        owner_name=owner_name or None,
+        owner_username=bc.user.username,
     )
     log.info(
         "Business connection %s: enabled=%s delete_all=%s delete_sent=%s",

@@ -36,3 +36,8 @@ CACHE_MAX_AGE_DAYS = float(os.environ.get("CACHE_MAX_AGE_DAYS", "1"))
 # Бот должен быть администратором этого канала, иначе проверку подписки провести не получится.
 # Если переменная не задана — проверка подписки отключена.
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip().lstrip("@") or None
+
+# Telegram user_id владельца бота — только этому аккаунту доступна команда /admin
+# (статистика: сколько людей запускало бота, кто подключил Business-аккаунт).
+_admin_raw = os.environ.get("ADMIN_ID", "").strip()
+ADMIN_ID = int(_admin_raw) if _admin_raw.isdigit() else None
