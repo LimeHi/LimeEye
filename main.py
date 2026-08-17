@@ -6,7 +6,7 @@ from io import BytesIO
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import BotCommand, BufferedInputFile
 
 from config import (
@@ -195,12 +195,14 @@ async def cmd_admin(message: types.Message):
         return
 
     users_total = await storage.count_users()
+    broadcast_recipients = await storage.count_broadcast_recipients()
     conns_total, conns_active = await storage.count_connections()
 
     lines = [
         f"👑 <b>Админ-панель {BOT_NAME}</b>",
         "",
         f"👥 Всего заходило в бота (уникальных /start): <b>{users_total}</b>",
+        f"📣 Получателей рассылки: <b>{broadcast_recipients}</b> (команда /broadcast)",
         f"🔌 Подключений Business-аккаунта: <b>{conns_active}</b> активно / "
         f"<b>{conns_total}</b> всего за всё время",
         "",
@@ -236,6 +238,179 @@ async def cmd_admin(message: types.Message):
         text = text[:4000] + "\n\n…список обрезан, слишком много записей."
 
     await message.answer(text, disable_web_page_preview=True)
+
+
+# ---------- рассылка (broadcast) ----------
+
+BROADCAST_AWAITING_CONTENT = "awaiting_content"
+BROADCAST_AWAITING_CONFIRM = "awaiting_confirm"
+BROADCAST_SENDING = "sending"
+
+# Простое состояние в памяти процесса — рассылку делает только ADMIN_ID,
+# так что персистентность/FSM-стораджа тут не нужна (при рестарте бота
+# незавершённый черновик рассылки просто исчезнет, и это ок).
+broadcast_state: dict[int, str] = {}            # admin_chat_id -> стадия
+broadcast_draft: dict[int, types.Message] = {}  # admin_chat_id -> сообщение-черновик для рассылки
+
+BROADCAST_SEND_DELAY = 0.05  # пауза между отправками (~20 сообщений/сек — с запасом от лимита Telegram)
+
+
+def build_broadcast_confirm_kb() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="✅ Отправить всем", callback_data="broadcast:confirm")],
+        [types.InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast:cancel")],
+    ])
+
+
+async def start_broadcast_flow(message: types.Message):
+    admin_chat_id = message.chat.id
+    broadcast_state[admin_chat_id] = BROADCAST_AWAITING_CONTENT
+    broadcast_draft.pop(admin_chat_id, None)
+
+    recipients = await storage.count_broadcast_recipients()
+    await message.answer(
+        "📣 <b>Режим рассылки</b>\n\n"
+        f"Получателей сейчас: <b>{recipients}</b>\n\n"
+        "Пришли одним сообщением то, что нужно разослать — текст, фото, видео, "
+        "документ или голосовое, с подписью или без. Форматирование и медиа "
+        "сохранятся как в оригинале.\n\n"
+        "Чтобы выйти из режима рассылки — напиши /cancel."
+    )
+
+
+async def handle_broadcast_content(message: types.Message):
+    admin_chat_id = message.chat.id
+    broadcast_draft[admin_chat_id] = message
+    broadcast_state[admin_chat_id] = BROADCAST_AWAITING_CONFIRM
+
+    try:
+        await bot.copy_message(
+            chat_id=admin_chat_id,
+            from_chat_id=admin_chat_id,
+            message_id=message.message_id,
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось показать превью рассылки (chat_id=%s)", admin_chat_id)
+
+    recipients = await storage.count_broadcast_recipients()
+    await message.answer(
+        f"👆 Вот так рассылка придёт получателям.\n\n"
+        f"Получателей: <b>{recipients}</b>.\n\n"
+        "Отправляем?",
+        reply_markup=build_broadcast_confirm_kb(),
+    )
+
+
+async def run_broadcast(admin_chat_id: int, status_message: types.Message):
+    draft = broadcast_draft.get(admin_chat_id)
+    if not draft:
+        return
+
+    chat_ids = await storage.list_broadcast_chat_ids()
+    total = len(chat_ids)
+    sent = 0
+    blocked = 0
+    failed = 0
+
+    async def _report_progress(i: int):
+        try:
+            await status_message.edit_text(
+                "📣 <b>Рассылка идёт…</b>\n\n"
+                f"Прогресс: {i}/{total}\n"
+                f"✅ Доставлено: {sent}\n"
+                f"🚫 Заблокировали бота: {blocked}\n"
+                f"⚠️ Ошибок: {failed}"
+            )
+        except TelegramAPIError:
+            pass
+
+    for i, chat_id in enumerate(chat_ids, start=1):
+        try:
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=admin_chat_id,
+                message_id=draft.message_id,
+            )
+            sent += 1
+        except TelegramForbiddenError:
+            blocked += 1
+            await storage.mark_user_blocked(chat_id)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=admin_chat_id,
+                    message_id=draft.message_id,
+                )
+                sent += 1
+            except TelegramForbiddenError:
+                blocked += 1
+                await storage.mark_user_blocked(chat_id)
+            except TelegramAPIError:
+                failed += 1
+        except TelegramAPIError:
+            log.exception("Ошибка рассылки для chat_id=%s", chat_id)
+            failed += 1
+
+        if i % 20 == 0 or i == total:
+            await _report_progress(i)
+
+        await asyncio.sleep(BROADCAST_SEND_DELAY)
+
+    try:
+        await status_message.edit_text(
+            "📣 <b>Рассылка завершена</b>\n\n"
+            f"Всего получателей: {total}\n"
+            f"✅ Доставлено: {sent}\n"
+            f"🚫 Заблокировали бота (исключены из будущих рассылок): {blocked}\n"
+            f"⚠️ Ошибок: {failed}"
+        )
+    except TelegramAPIError:
+        pass
+
+    broadcast_state.pop(admin_chat_id, None)
+    broadcast_draft.pop(admin_chat_id, None)
+
+
+@dp.callback_query(F.data.startswith("broadcast:"))
+async def on_broadcast_callback(callback: types.CallbackQuery):
+    if ADMIN_ID is None or callback.from_user is None or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+
+    message = callback.message
+    admin_chat_id = message.chat.id if message else callback.from_user.id
+    action = callback.data.split(":", 1)[1]
+
+    if action == "cancel":
+        broadcast_state.pop(admin_chat_id, None)
+        broadcast_draft.pop(admin_chat_id, None)
+        await callback.answer("Отменено.")
+        if message:
+            try:
+                await message.edit_text("❌ Рассылка отменена.")
+            except TelegramAPIError:
+                pass
+        return
+
+    if action == "confirm":
+        if broadcast_state.get(admin_chat_id) != BROADCAST_AWAITING_CONFIRM or admin_chat_id not in broadcast_draft:
+            await callback.answer("Черновик рассылки не найден — начни заново через /broadcast.", show_alert=True)
+            return
+        if message is None:
+            await callback.answer()
+            return
+        broadcast_state[admin_chat_id] = BROADCAST_SENDING
+        await callback.answer("Рассылка запущена!")
+        try:
+            await message.edit_text("📣 Рассылка запущена, это может занять некоторое время…")
+        except TelegramAPIError:
+            pass
+        asyncio.create_task(run_broadcast(admin_chat_id, message))
+        return
+
+    await callback.answer()
 
 
 # ---------- фишка: часы в имени/фамилии ----------
@@ -430,7 +605,29 @@ async def on_features_callback(callback: types.CallbackQuery):
 
 @dp.message()
 async def on_direct_message(message: types.Message):
+    is_admin = (
+        ADMIN_ID is not None and message.from_user is not None and message.from_user.id == ADMIN_ID
+    )
+
+    # ---- режим рассылки: перехватываем контент до общей проверки на текст,
+    # чтобы можно было рассылать и фото/видео/документы, а не только текст ----
+    if is_admin and message.chat.id in broadcast_state:
+        if message.text and message.text.startswith("/cancel"):
+            broadcast_state.pop(message.chat.id, None)
+            broadcast_draft.pop(message.chat.id, None)
+            await message.answer("❌ Рассылка отменена.")
+            return
+        if broadcast_state.get(message.chat.id) == BROADCAST_AWAITING_CONTENT:
+            await handle_broadcast_content(message)
+            return
+
     if not message.text:
+        return
+
+    if message.text.startswith(("/broadcast", "рассылка", "Рассылка")):
+        if not is_admin:
+            return
+        await start_broadcast_flow(message)
         return
 
     if CHANNEL_USERNAME and message.text.startswith(("/start", "/help", "/muted", "/hangman")):

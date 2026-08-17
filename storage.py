@@ -170,6 +170,7 @@ MIGRATIONS = [
     ("connections", "owner_first_name", "TEXT"),
     ("connections", "owner_last_name", "TEXT"),
     ("connections", "can_edit_name", "INTEGER"),
+    ("bot_users", "blocked", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -420,7 +421,8 @@ class Storage:
                  name=excluded.name,
                  username=excluded.username,
                  last_seen=excluded.last_seen,
-                 starts_count=starts_count + 1
+                 starts_count=starts_count + 1,
+                 blocked=0
             """,
             (user_id, chat_id, _enc(name), _enc(username), now, now),
         )
@@ -483,6 +485,30 @@ class Storage:
                 "starts_count": starts_count,
             })
         return result
+
+    # ---------- рассылка ----------
+
+    async def list_broadcast_chat_ids(self) -> list[int]:
+        """Все chat_id пользователей, которые не заблокировали бота — получатели рассылки."""
+        cur = await self._db.execute(
+            "SELECT DISTINCT chat_id FROM bot_users WHERE blocked = 0 OR blocked IS NULL"
+        )
+        rows = await cur.fetchall()
+        return [row[0] for row in rows]
+
+    async def count_broadcast_recipients(self) -> int:
+        cur = await self._db.execute(
+            "SELECT COUNT(DISTINCT chat_id) FROM bot_users WHERE blocked = 0 OR blocked IS NULL"
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def mark_user_blocked(self, chat_id: int):
+        """Помечает пользователя как заблокировавшего бота — исключается из будущих рассылок."""
+        await self._db.execute(
+            "UPDATE bot_users SET blocked = 1 WHERE chat_id = ?", (chat_id,)
+        )
+        await self._db.commit()
 
     # ---------- крестики-нолики ----------
 
