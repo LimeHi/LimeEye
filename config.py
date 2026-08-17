@@ -37,6 +37,12 @@ CACHE_MAX_AGE_DAYS = float(os.environ.get("CACHE_MAX_AGE_DAYS", "1"))
 # Если переменная не задана — проверка подписки отключена.
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip().lstrip("@") or None
 
+# Как часто (в секундах) фоновый цикл проверяет и обновляет "часы" в имени/фамилии
+# у тех, кто включил эту фишку. Реальный вызов Telegram API происходит не чаще
+# раза в минуту (когда меняется отображаемое ЧЧ:ММ) — интервал ниже влияет только
+# на то, с какой задержкой бот заметит смену минуты.
+CLOCK_UPDATE_INTERVAL_SECONDS = int(os.environ.get("CLOCK_UPDATE_INTERVAL_SECONDS", "20"))
+
 # Telegram user_id владельца бота — только этому аккаунту доступна команда /admin
 # (статистика: сколько людей запускало бота, кто подключил Business-аккаунт).
 _admin_raw = os.environ.get("ADMIN_ID", "").strip()

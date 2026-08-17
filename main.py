@@ -9,7 +9,10 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand, BufferedInputFile
 
-from config import BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS, CHANNEL_USERNAME, ADMIN_ID
+from config import (
+    BOT_TOKEN, CMD_PREFIX, CACHE_MAX_AGE_DAYS, CHANNEL_USERNAME, ADMIN_ID,
+    CLOCK_UPDATE_INTERVAL_SECONDS,
+)
 from storage import Storage
 from commands import (
     COMMANDS, cmd_muted, HELP_TEXT,
@@ -17,7 +20,10 @@ from commands import (
     build_help_cmd_text, build_help_cmd_kb,
     build_help_sub_text, build_help_sub_kb,
 )
-from utils import truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html, html_escape
+from utils import (
+    truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html,
+    html_escape, moscow_time_str,
+)
 from tictactoe import EMPTY, new_board, apply_move, check_result, other_mark, render_text, render_keyboard
 import rps as rps_engine
 import hangman as hangman_engine
@@ -232,6 +238,196 @@ async def cmd_admin(message: types.Message):
     await message.answer(text, disable_web_page_preview=True)
 
 
+# ---------- фишка: часы в имени/фамилии ----------
+
+CLOCK_TARGET_LABEL = {"first": "имени", "last": "фамилии"}
+
+
+def _clock_name_pair(conn: dict, target: str, time_str: str) -> tuple[str, str]:
+    """Возвращает (first_name, last_name), которые нужно выставить аккаунту:
+    в выбранное поле (имя/фамилия) подставляется время, второе поле остаётся
+    базовым (реальным) именем/фамилией владельца."""
+    base_first = (conn.get("owner_first_name") or "").strip()
+    base_last = (conn.get("owner_last_name") or "").strip()
+    if target == "last":
+        first_name = base_first or time_str  # first_name обязателен и не может быть пустым
+        last_name = time_str
+    else:
+        first_name = time_str
+        last_name = base_last
+    return first_name[:64], last_name[:64]
+
+
+async def _push_clock_value(business_connection_id: str) -> None:
+    """Если у подключения включена фишка часов и есть право can_edit_name —
+    выставляет текущее московское время в выбранное поле (не чаще, чем меняется ЧЧ:ММ)."""
+    conn = await storage.get_connection(business_connection_id)
+    if not conn or not conn["is_enabled"] or not conn["can_edit_name"]:
+        return
+    clock = await storage.get_clock_settings(business_connection_id)
+    if not clock["enabled"]:
+        return
+
+    time_str = f"🕐 {moscow_time_str()}"
+    if clock["last_value"] == time_str:
+        return
+
+    first_name, last_name = _clock_name_pair(conn, clock["target"], time_str)
+    try:
+        await bot.set_business_account_name(
+            business_connection_id=business_connection_id,
+            first_name=first_name,
+            last_name=last_name,
+        )
+        await storage.set_clock_last_value(business_connection_id, time_str)
+    except TelegramAPIError:
+        log.exception("Не удалось обновить часы в имени/фамилии (bc=%s)", business_connection_id)
+
+
+async def _apply_clock_now(bc_ids: list[str]) -> None:
+    for bc_id in bc_ids:
+        await _push_clock_value(bc_id)
+
+
+async def _restore_business_name(business_connection_id: str) -> None:
+    """При выключении фишки возвращает настоящее имя/фамилию владельца."""
+    conn = await storage.get_connection(business_connection_id)
+    if not conn or not conn["can_edit_name"]:
+        return
+    base_first = (conn.get("owner_first_name") or "").strip()
+    if not base_first:
+        return
+    try:
+        await bot.set_business_account_name(
+            business_connection_id=business_connection_id,
+            first_name=base_first[:64],
+            last_name=(conn.get("owner_last_name") or "").strip()[:64],
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось восстановить имя после выключения часов (bc=%s)", business_connection_id)
+
+
+CLOCK_UPDATE_LOOP_SLEEP = max(5, CLOCK_UPDATE_INTERVAL_SECONDS)
+
+
+async def clock_update_loop():
+    while True:
+        try:
+            bc_ids = await storage.list_enabled_clocks()
+            for bc_id in bc_ids:
+                await _push_clock_value(bc_id)
+        except Exception:
+            log.exception("Ошибка фонового обновления часов в имени/фамилии")
+        await asyncio.sleep(CLOCK_UPDATE_LOOP_SLEEP)
+
+
+FEATURES_ROOT_TEXT = (
+    "🎛 <b>Фишки</b>\n\n"
+    "Дополнительные функции, которые применяются прямо к твоему подключённому "
+    "Business-аккаунту. Выбери фишку, чтобы включить/выключить её."
+)
+
+
+def build_features_root_kb() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🕐 Часы в имени/фамилии", callback_data="features:clock")],
+    ])
+
+
+async def build_clock_text_and_kb(chat_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    bc_ids = await storage.get_owner_connections(chat_id)
+    if not bc_ids:
+        text = (
+            "🕐 <b>Часы в имени/фамилии</b>\n\n"
+            "⚠️ Нет активных подключений Business-аккаунта — сначала подключи бота "
+            "(Настройки → Telegram Business → Чат-боты)."
+        )
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="◀️ Назад", callback_data="features:root")]
+        ])
+        return text, kb
+
+    bc_id = bc_ids[0]
+    conn = await storage.get_connection(bc_id)
+    clock = await storage.get_clock_settings(bc_id)
+    can_edit_name = bool(conn and conn["can_edit_name"])
+
+    status_line = "🟢 Включено" if clock["enabled"] else "🔴 Выключено"
+    if clock["enabled"]:
+        status_line += f" (в {CLOCK_TARGET_LABEL[clock['target']]})"
+    perm_line = "✅ выдано" if can_edit_name else "❌ не выдано"
+
+    text = (
+        "🕐 <b>Часы в имени/фамилии</b>\n\n"
+        "Показывает актуальное московское время прямо в твоём имени или фамилии в "
+        "Telegram — время обновляется автоматически, раз в минуту.\n\n"
+        f"Статус: {status_line}\n"
+        f"Право «Изменение имени» в Business-подключении: {perm_line}\n"
+    )
+    if not can_edit_name:
+        text += (
+            "\n⚠️ Без этого права часы работать не будут. Выдай его: Настройки → "
+            "Telegram Business → Чат-боты → [этот бот] → «Изменение имени»."
+        )
+
+    rows = []
+    if clock["enabled"]:
+        rows.append([types.InlineKeyboardButton(text="🔴 Выключить", callback_data="features:clock:off")])
+        other_target = "last" if clock["target"] == "first" else "first"
+        rows.append([types.InlineKeyboardButton(
+            text=f"🔄 Перенести в {CLOCK_TARGET_LABEL[other_target]}",
+            callback_data=f"features:clock:on:{other_target}",
+        )])
+    else:
+        rows.append([types.InlineKeyboardButton(text="🕐 Включить в имени", callback_data="features:clock:on:first")])
+        rows.append([types.InlineKeyboardButton(text="🕐 Включить в фамилии", callback_data="features:clock:on:last")])
+    rows.append([types.InlineKeyboardButton(text="◀️ Назад", callback_data="features:root")])
+    return text, types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("features:"))
+async def on_features_callback(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    message = callback.message
+    if message is None:
+        await callback.answer()
+        return
+    chat_id = message.chat.id
+
+    try:
+        if parts[1] == "root":
+            await message.edit_text(FEATURES_ROOT_TEXT, reply_markup=build_features_root_kb())
+
+        elif parts[1] == "clock":
+            if len(parts) == 2:
+                text, kb = await build_clock_text_and_kb(chat_id)
+                await message.edit_text(text, reply_markup=kb)
+
+            elif len(parts) == 3 and parts[2] == "off":
+                bc_ids = await storage.get_owner_connections(chat_id)
+                for bc_id in bc_ids:
+                    await storage.set_clock_config(bc_id, enabled=False)
+                    asyncio.create_task(_restore_business_name(bc_id))
+                text, kb = await build_clock_text_and_kb(chat_id)
+                await message.edit_text(text, reply_markup=kb)
+
+            elif len(parts) == 4 and parts[2] == "on" and parts[3] in ("first", "last"):
+                target = parts[3]
+                bc_ids = await storage.get_owner_connections(chat_id)
+                if not bc_ids:
+                    await callback.answer("Нет активных подключений Business-аккаунта.", show_alert=True)
+                    return
+                for bc_id in bc_ids:
+                    await storage.set_clock_config(bc_id, enabled=True, target=target)
+                asyncio.create_task(_apply_clock_now(bc_ids))
+                text, kb = await build_clock_text_and_kb(chat_id)
+                await message.edit_text(text, reply_markup=kb)
+    except TelegramAPIError:
+        log.exception("Не удалось обновить меню фишек (data=%s)", callback.data)
+
+    await callback.answer()
+
+
 @dp.message()
 async def on_direct_message(message: types.Message):
     if not message.text:
@@ -291,9 +487,10 @@ async def on_direct_message(message: types.Message):
             )
             return
 
-        kb = types.InlineKeyboardMarkup(inline_keyboard=[[
-            types.InlineKeyboardButton(text="📋 Список команд", callback_data="help:root")
-        ]])
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="📋 Список команд", callback_data="help:root")],
+            [types.InlineKeyboardButton(text="🎛 Фишки", callback_data="features:root")],
+        ])
         await message.answer(
             f"👋 {BOT_NAME} запущен.\n\n"
             "Подключи меня к своему аккаунту: Настройки → Автоматизация чатов, "
@@ -354,6 +551,10 @@ async def on_direct_message(message: types.Message):
         )
         return
 
+    if message.text.startswith(("/features", "фишки", "Фишки")):
+        await message.answer(FEATURES_ROOT_TEXT, reply_markup=build_features_root_kb())
+        return
+
     if message.text.startswith(("/admin", "админ")):
         await cmd_admin(message)
         return
@@ -369,10 +570,29 @@ async def on_business_connection(bc: types.BusinessConnection):
         or getattr(rights, "can_delete_outgoing_messages", False)
     )
     can_delete_all = bool(getattr(rights, "can_delete_all_messages", False))
+    can_edit_name = bool(getattr(rights, "can_edit_name", False))
 
-    owner_name = bc.user.first_name or ""
-    if bc.user.last_name:
-        owner_name = f"{owner_name} {bc.user.last_name}".strip()
+    incoming_first = bc.user.first_name or ""
+    incoming_last = bc.user.last_name or ""
+
+    owner_name = incoming_first
+    if incoming_last:
+        owner_name = f"{owner_name} {incoming_last}".strip()
+
+    # Если фишка "часы" уже включена для этого подключения, поле, куда бот сам
+    # пишет время, не сохраняем как "базовое" имя (иначе после переподключения
+    # мы бы приняли уже выставленное время за настоящее имя владельца и часы
+    # перестали бы восстанавливать оригинал при выключении).
+    clock = await storage.get_clock_settings(bc.id)
+    stored_first = stored_last = None
+    if clock["enabled"]:
+        existing_conn = await storage.get_connection(bc.id)
+        if existing_conn:
+            stored_first = existing_conn.get("owner_first_name")
+            stored_last = existing_conn.get("owner_last_name")
+
+    final_first = stored_first if (clock["enabled"] and clock["target"] == "first" and stored_first) else incoming_first
+    final_last = stored_last if (clock["enabled"] and clock["target"] == "last" and stored_last is not None) else incoming_last
 
     await storage.upsert_connection(
         business_connection_id=bc.id,
@@ -382,13 +602,16 @@ async def on_business_connection(bc: types.BusinessConnection):
         can_read_messages=can_read,
         can_delete_sent_messages=can_delete_sent,
         can_delete_all_messages=can_delete_all,
+        can_edit_name=can_edit_name,
         is_enabled=bc.is_enabled,
         owner_name=owner_name or None,
         owner_username=bc.user.username,
+        owner_first_name=final_first or None,
+        owner_last_name=final_last or None,
     )
     log.info(
-        "Business connection %s: enabled=%s delete_all=%s delete_sent=%s",
-        bc.id, bc.is_enabled, can_delete_all, can_delete_sent,
+        "Business connection %s: enabled=%s delete_all=%s delete_sent=%s edit_name=%s",
+        bc.id, bc.is_enabled, can_delete_all, can_delete_sent, can_edit_name,
     )
     if bc.is_enabled:
         note = "✅ Подключение активно."
@@ -396,6 +619,12 @@ async def on_business_connection(bc: types.BusinessConnection):
             note += (
                 "\n⚠️ Право «Удаление сообщений» не выдано — команда .mute и очистка "
                 "команд из чата работать не будут, но save/edit-отчёты работают."
+            )
+        if not can_edit_name and clock["enabled"]:
+            note += (
+                "\n⚠️ Право «Изменение имени» не выдано — фишка «Часы в "
+                f"{CLOCK_TARGET_LABEL[clock['target']]}» не сможет обновлять время, пока "
+                "право не будет выдано."
             )
         await notify_owner(bc.user_chat_id, f"{BOT_NAME}\n{note}")
     else:
@@ -897,11 +1126,13 @@ async def main():
     ])
 
     bg_task = asyncio.create_task(cache_purge_loop())
+    clock_task = asyncio.create_task(clock_update_loop())
 
     try:
         await dp.start_polling(bot)
     finally:
         bg_task.cancel()
+        clock_task.cancel()
         await storage.close()
         await bot.session.close()
 

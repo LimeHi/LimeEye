@@ -1,7 +1,15 @@
 import re
+from datetime import datetime, timedelta, timezone
 from html import escape as _escape
 
 from aiogram.types import Message
+
+MOSCOW_TZ = timezone(timedelta(hours=3))  # MSK, без перехода на летнее/зимнее время с 2014 года
+
+
+def moscow_time_str() -> str:
+    """Текущее московское время в формате ЧЧ:ММ, для фишки 'часы в имени/фамилии'."""
+    return datetime.now(MOSCOW_TZ).strftime("%H:%M")
 
 DURATION_RE = re.compile(r"(\d+)\s*(d|h|m|s)", re.IGNORECASE)
 UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}

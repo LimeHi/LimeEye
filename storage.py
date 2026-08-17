@@ -146,6 +146,15 @@ CREATE TABLE IF NOT EXISTS pending_hangman_words (
     word TEXT NOT NULL,
     created_at INTEGER
 );
+
+-- Фишка "Часы в имени/фамилии": настройка на каждое business-подключение.
+CREATE TABLE IF NOT EXISTS clock_settings (
+    business_connection_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    target TEXT NOT NULL DEFAULT 'first',  -- 'first' (имя) | 'last' (фамилия)
+    last_value TEXT,                       -- последнее выставленное значение времени (не шифруем, не чувствительно)
+    updated_at INTEGER
+);
 """
 
 # Колонки, добавленные уже после первого релиза — накатываются на существующие
@@ -158,6 +167,9 @@ MIGRATIONS = [
     ("connections", "owner_name", "TEXT"),
     ("connections", "owner_username", "TEXT"),
     ("connections", "created_at", "INTEGER"),
+    ("connections", "owner_first_name", "TEXT"),
+    ("connections", "owner_last_name", "TEXT"),
+    ("connections", "can_edit_name", "INTEGER"),
 ]
 
 
@@ -189,36 +201,44 @@ class Storage:
     async def upsert_connection(self, business_connection_id, owner_user_id, owner_chat_id,
                                  can_reply, can_read_messages, can_delete_sent_messages,
                                  can_delete_all_messages, is_enabled,
-                                 owner_name=None, owner_username=None):
+                                 owner_name=None, owner_username=None,
+                                 owner_first_name=None, owner_last_name=None,
+                                 can_edit_name=False):
         now = int(time.time())
         await self._db.execute(
             """INSERT INTO connections
                (business_connection_id, owner_user_id, owner_chat_id, owner_name, owner_username,
-                can_reply, can_read_messages, can_delete_sent_messages, can_delete_all_messages,
+                owner_first_name, owner_last_name, can_reply, can_read_messages,
+                can_delete_sent_messages, can_delete_all_messages, can_edit_name,
                 is_enabled, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(business_connection_id) DO UPDATE SET
                  owner_user_id=excluded.owner_user_id,
                  owner_chat_id=excluded.owner_chat_id,
                  owner_name=excluded.owner_name,
                  owner_username=excluded.owner_username,
+                 owner_first_name=excluded.owner_first_name,
+                 owner_last_name=excluded.owner_last_name,
                  can_reply=excluded.can_reply,
                  can_read_messages=excluded.can_read_messages,
                  can_delete_sent_messages=excluded.can_delete_sent_messages,
                  can_delete_all_messages=excluded.can_delete_all_messages,
+                 can_edit_name=excluded.can_edit_name,
                  is_enabled=excluded.is_enabled,
                  updated_at=excluded.updated_at
             """,
             (business_connection_id, owner_user_id, owner_chat_id, _enc(owner_name), _enc(owner_username),
+             _enc(owner_first_name), _enc(owner_last_name),
              int(can_reply), int(can_read_messages), int(can_delete_sent_messages),
-             int(can_delete_all_messages), int(is_enabled), now, now),
+             int(can_delete_all_messages), int(can_edit_name), int(is_enabled), now, now),
         )
         await self._db.commit()
 
     async def get_connection(self, business_connection_id):
         cur = await self._db.execute(
             "SELECT business_connection_id, owner_user_id, owner_chat_id, can_reply, "
-            "can_read_messages, can_delete_sent_messages, can_delete_all_messages, is_enabled "
+            "can_read_messages, can_delete_sent_messages, can_delete_all_messages, is_enabled, "
+            "owner_first_name, owner_last_name, can_edit_name "
             "FROM connections WHERE business_connection_id = ?",
             (business_connection_id,),
         )
@@ -227,11 +247,13 @@ class Storage:
             return None
         keys = ["business_connection_id", "owner_user_id", "owner_chat_id", "can_reply",
                 "can_read_messages", "can_delete_sent_messages", "can_delete_all_messages",
-                "is_enabled"]
+                "is_enabled", "owner_first_name", "owner_last_name", "can_edit_name"]
         data = dict(zip(keys, row))
         for k in ("can_reply", "can_read_messages", "can_delete_sent_messages",
-                  "can_delete_all_messages", "is_enabled"):
+                  "can_delete_all_messages", "is_enabled", "can_edit_name"):
             data[k] = bool(data[k])
+        data["owner_first_name"] = _dec(data["owner_first_name"])
+        data["owner_last_name"] = _dec(data["owner_last_name"])
         return data
 
     # ---------- кэш сообщений ----------
@@ -677,3 +699,49 @@ class Storage:
             )
             await self._db.commit()
         return word
+
+    # ---------- фишка: часы в имени/фамилии ----------
+
+    async def get_clock_settings(self, business_connection_id) -> dict:
+        cur = await self._db.execute(
+            "SELECT enabled, target, last_value FROM clock_settings WHERE business_connection_id = ?",
+            (business_connection_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return {"enabled": False, "target": "first", "last_value": None}
+        enabled, target, last_value = row
+        return {"enabled": bool(enabled), "target": target or "first", "last_value": last_value}
+
+    async def set_clock_config(self, business_connection_id, enabled: bool, target: str | None = None):
+        """Включает/выключает часы и (опционально) меняет место (target: 'first'/'last').
+        При любом изменении конфигурации last_value сбрасывается, чтобы фоновый цикл
+        сразу же выставил актуальное время, не дожидаясь смены минуты."""
+        if target is None:
+            existing = await self.get_clock_settings(business_connection_id)
+            target = existing["target"]
+        now = int(time.time())
+        await self._db.execute(
+            """INSERT INTO clock_settings (business_connection_id, enabled, target, last_value, updated_at)
+               VALUES (?, ?, ?, NULL, ?)
+               ON CONFLICT(business_connection_id) DO UPDATE SET
+                 enabled=excluded.enabled, target=excluded.target,
+                 last_value=NULL, updated_at=excluded.updated_at""",
+            (business_connection_id, int(enabled), target, now),
+        )
+        await self._db.commit()
+
+    async def set_clock_last_value(self, business_connection_id, value: str):
+        await self._db.execute(
+            "UPDATE clock_settings SET last_value = ?, updated_at = ? WHERE business_connection_id = ?",
+            (value, int(time.time()), business_connection_id),
+        )
+        await self._db.commit()
+
+    async def list_enabled_clocks(self):
+        """Все business-подключения, у которых включена фишка часов — для фонового цикла."""
+        cur = await self._db.execute(
+            "SELECT business_connection_id FROM clock_settings WHERE enabled = 1"
+        )
+        rows = await cur.fetchall()
+        return [row[0] for row in rows]
