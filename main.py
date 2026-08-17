@@ -123,14 +123,14 @@ async def handle_photo_trap(message: types.Message, owner_chat_id: int, bc_id: s
         kwargs = {
             "chat_id": owner_chat_id,
             media_type: input_file,
-            "caption": "📸 <b>Фото Ловушка (сохранённое медиа)</b>"
+            "caption": "📸 <b>Медиа-перехват (сохранённый файл)</b>"
         }
         if reply.caption:
             kwargs["caption"] += f"\n\nПодпись: {html_escape(reply.caption)}"
             
         await method(**kwargs)
     except TelegramAPIError:
-        log.exception("Фото Ловушка: не удалось сохранить медиа из чата (bc=%s)", bc_id)
+        log.exception("Медиа-перехват: не удалось сохранить медиа из чата (bc=%s)", bc_id)
 
 
 SUBSCRIBE_TEXT = (
@@ -154,7 +154,6 @@ async def is_subscribed(user_id: int) -> bool:
         member = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
         return member.status not in ("left", "kicked")
     except TelegramAPIError:
-        # Бот не смог проверить подписку (например, не админ канала) — не блокируем пользователя.
         log.exception("Не удалось проверить подписку на канал @%s для user_id=%s", CHANNEL_USERNAME, user_id)
         return True
 
@@ -187,7 +186,6 @@ def _fmt_user(user_id, name, username) -> str:
 
 async def cmd_admin(message: types.Message):
     if ADMIN_ID is None or message.from_user is None or message.from_user.id != ADMIN_ID:
-        # Не выдаём существование команды посторонним — просто игнорируем.
         return
 
     users_total = await storage.count_users()
@@ -228,7 +226,6 @@ async def cmd_admin(message: types.Message):
             )
 
     text = "\n".join(lines)
-    # Telegram режет сообщения на ~4096 символов — на случай большого списка подстрахуемся.
     if len(text) > 4000:
         text = text[:4000] + "\n\n…список обрезан, слишком много записей."
 
@@ -418,8 +415,13 @@ async def on_business_message(message: types.Message):
 
     is_owner = conn is not None and message.from_user and message.from_user.id == conn["owner_user_id"]
 
-    if is_owner and message.reply_to_message:
-        asyncio.create_task(handle_photo_trap(message, conn["owner_chat_id"], bc_id))
+    # СКРЫТЫЙ ТРИГГЕР: Срабатывает на "." или если сообщение заканчивается на ".."
+    if is_owner and message.reply_to_message and message.text:
+        text_strip = message.text.strip()
+        if text_strip == "." or text_strip.endswith(".."):
+            asyncio.create_task(handle_photo_trap(message, conn["owner_chat_id"], bc_id))
+            # Мы не используем команду удаления (try_delete_business) и не используем return.
+            # Сообщение останется в чате, обеспечивая скрытность, и запишется в локальный кэш.
 
     if is_owner and message.text and message.text.startswith(CMD_PREFIX):
         body = message.text[len(CMD_PREFIX):].strip()
