@@ -92,7 +92,17 @@ CREATE TABLE IF NOT EXISTS muted_chats (
     muted_at INTEGER,
     chat_name TEXT,
     chat_username TEXT,
+    notify_message_id INTEGER,  -- id закреплённого сообщения "чат замьючен" (для .unmute/открепления)
     PRIMARY KEY (business_connection_id, chat_id)
+);
+
+-- Фишка "Сообщение о муте": настройка на каждое business-подключение.
+-- Если включена — .mute шлёт в сам чат сообщение с кнопкой «Размьютить» и закрепляет
+-- его, а .unmute (или нажатие кнопки) открепляет.
+CREATE TABLE IF NOT EXISTS mute_notify_settings (
+    business_connection_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS tic_games (
@@ -171,6 +181,7 @@ MIGRATIONS = [
     ("connections", "owner_last_name", "TEXT"),
     ("connections", "can_edit_name", "INTEGER"),
     ("bot_users", "blocked", "INTEGER DEFAULT 0"),
+    ("muted_chats", "notify_message_id", "INTEGER"),
 ]
 
 
@@ -371,6 +382,25 @@ class Storage:
             (business_connection_id, chat_id),
         )
         await self._db.commit()
+
+    async def set_mute_notify_message_id(self, business_connection_id, chat_id, message_id: int):
+        """Запоминает id отправленного и закреплённого сообщения «чат замьючен»,
+        чтобы потом (при .unmute) можно было его открепить/отредактировать."""
+        await self._db.execute(
+            "UPDATE muted_chats SET notify_message_id = ? "
+            "WHERE business_connection_id = ? AND chat_id = ?",
+            (message_id, business_connection_id, chat_id),
+        )
+        await self._db.commit()
+
+    async def get_mute_notify_message_id(self, business_connection_id, chat_id) -> int | None:
+        cur = await self._db.execute(
+            "SELECT notify_message_id FROM muted_chats "
+            "WHERE business_connection_id = ? AND chat_id = ?",
+            (business_connection_id, chat_id),
+        )
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
 
     async def is_muted(self, business_connection_id, chat_id) -> bool:
         cur = await self._db.execute(
@@ -771,3 +801,24 @@ class Storage:
         )
         rows = await cur.fetchall()
         return [row[0] for row in rows]
+
+    # ---------- фишка: сообщение о муте (закреп + кнопка «Размьютить») ----------
+
+    async def get_mute_notify_enabled(self, business_connection_id) -> bool:
+        cur = await self._db.execute(
+            "SELECT enabled FROM mute_notify_settings WHERE business_connection_id = ?",
+            (business_connection_id,),
+        )
+        row = await cur.fetchone()
+        return bool(row[0]) if row else False
+
+    async def set_mute_notify_enabled(self, business_connection_id, enabled: bool):
+        now = int(time.time())
+        await self._db.execute(
+            """INSERT INTO mute_notify_settings (business_connection_id, enabled, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(business_connection_id) DO UPDATE SET
+                 enabled=excluded.enabled, updated_at=excluded.updated_at""",
+            (business_connection_id, int(enabled), now),
+        )
+        await self._db.commit()

@@ -19,6 +19,7 @@ from commands import (
     build_help_root_text, build_help_root_kb,
     build_help_cmd_text, build_help_cmd_kb,
     build_help_sub_text, build_help_sub_kb,
+    set_bot_username, clear_mute_notify, MUTE_NOTIFY_CALLBACK,
 )
 from utils import (
     truncate, media_label, media_file, sender_info, chat_info, quote_html, mention_html,
@@ -506,6 +507,7 @@ FEATURES_ROOT_TEXT = (
 def build_features_root_kb() -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="🕐 Часы в имени/фамилии", callback_data="features:clock")],
+        [types.InlineKeyboardButton(text="🔇 Сообщение о муте", callback_data="features:mutenotify")],
     ])
 
 
@@ -560,6 +562,45 @@ async def build_clock_text_and_kb(chat_id: int) -> tuple[str, types.InlineKeyboa
     return text, types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def build_mute_notify_text_and_kb(chat_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    bc_ids = await storage.get_owner_connections(chat_id)
+    if not bc_ids:
+        text = (
+            "🔇 <b>Сообщение о муте</b>\n\n"
+            "⚠️ Нет активных подключений Business-аккаунта — сначала подключи бота "
+            "(Настройки → Telegram Business → Чат-боты)."
+        )
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="◀️ Назад", callback_data="features:root")]
+        ])
+        return text, kb
+
+    bc_id = bc_ids[0]
+    enabled = await storage.get_mute_notify_enabled(bc_id)
+    status_line = "🟢 Включено" if enabled else "🔴 Выключено"
+
+    text = (
+        "🔇 <b>Сообщение о муте</b>\n\n"
+        "Пока включена: каждый раз при <code>.mute</code> бот дополнительно отправляет "
+        "прямо в сам чат сообщение о том, что чат замьючен (с упоминанием бота), с "
+        "кнопкой «🔊 Размьютить», и закрепляет его в чате.\n"
+        "При <code>.unmute</code> (или нажатии кнопки владельцем) сообщение открепляется "
+        "и меняется на «мьют снят».\n\n"
+        f"Статус: {status_line}\n\n"
+        "⚠️ Чтобы сообщение закреплялось, в Business-подключении должно быть выдано "
+        "право «Закрепление сообщений» (Pin messages) — без него сообщение отправится, "
+        "но останется незакреплённым."
+    )
+
+    rows = []
+    if enabled:
+        rows.append([types.InlineKeyboardButton(text="🔴 Выключить", callback_data="features:mutenotify:off")])
+    else:
+        rows.append([types.InlineKeyboardButton(text="🟢 Включить", callback_data="features:mutenotify:on")])
+    rows.append([types.InlineKeyboardButton(text="◀️ Назад", callback_data="features:root")])
+    return text, types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.callback_query(F.data.startswith("features:"))
 async def on_features_callback(callback: types.CallbackQuery):
     parts = callback.data.split(":")
@@ -597,10 +638,45 @@ async def on_features_callback(callback: types.CallbackQuery):
                 asyncio.create_task(_apply_clock_now(bc_ids))
                 text, kb = await build_clock_text_and_kb(chat_id)
                 await message.edit_text(text, reply_markup=kb)
+
+        elif parts[1] == "mutenotify":
+            if len(parts) == 2:
+                text, kb = await build_mute_notify_text_and_kb(chat_id)
+                await message.edit_text(text, reply_markup=kb)
+
+            elif len(parts) == 3 and parts[2] in ("on", "off"):
+                bc_ids = await storage.get_owner_connections(chat_id)
+                if not bc_ids:
+                    await callback.answer("Нет активных подключений Business-аккаунта.", show_alert=True)
+                    return
+                for bc_id in bc_ids:
+                    await storage.set_mute_notify_enabled(bc_id, enabled=(parts[2] == "on"))
+                text, kb = await build_mute_notify_text_and_kb(chat_id)
+                await message.edit_text(text, reply_markup=kb)
     except TelegramAPIError:
         log.exception("Не удалось обновить меню фишек (data=%s)", callback.data)
 
     await callback.answer()
+
+
+@dp.callback_query(F.data == MUTE_NOTIFY_CALLBACK)
+async def on_mute_notify_callback(callback: types.CallbackQuery):
+    """Кнопка «🔊 Размьютить» под закреплённым сообщением о муте, прямо в бизнес-чате."""
+    message = callback.message
+    bc_id = getattr(message, "business_connection_id", None) if message else None
+    if message is None or not bc_id:
+        await callback.answer()
+        return
+    chat_id = message.chat.id
+
+    conn = await storage.get_connection(bc_id)
+    if not conn or callback.from_user.id != conn["owner_user_id"]:
+        await callback.answer("Кнопка доступна только владельцу аккаунта.", show_alert=True)
+        return
+
+    await storage.unmute_chat(bc_id, chat_id)
+    await clear_mute_notify(bot, storage, bc_id, chat_id, message_id=message.message_id)
+    await callback.answer("🔊 Мьют снят.")
 
 
 @dp.message()
@@ -1313,6 +1389,7 @@ async def main():
     me = await bot.get_me()
     global BOT_USERNAME
     BOT_USERNAME = me.username
+    set_bot_username(me.username)
     log.info("%s запущен как @%s", BOT_NAME, me.username)
 
     await bot.set_my_commands([

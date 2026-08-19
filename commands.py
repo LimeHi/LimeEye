@@ -5,6 +5,7 @@ import logging
 import math
 import operator
 import time
+from datetime import datetime, timezone
 from io import BytesIO
 
 import aiohttp
@@ -17,6 +18,21 @@ import rps as rps_engine
 import hangman as hangman_engine
 
 log = logging.getLogger("LimeEye")
+
+# Юзернейм бота — выставляется один раз при старте (main.py, после bot.get_me()),
+# чтобы можно было подставлять его в текст сообщения о муте без циклического импорта.
+BOT_USERNAME: str | None = None
+
+MUTE_NOTIFY_CALLBACK = "mutebtn:unmute"
+
+
+def set_bot_username(username: str | None) -> None:
+    global BOT_USERNAME
+    BOT_USERNAME = username
+
+
+def _bot_tag() -> str:
+    return f"@{BOT_USERNAME}" if BOT_USERNAME else "@LimeEyeBot"
 
 
 def _is_business_peer_invalid(exc: Exception) -> bool:
@@ -34,12 +50,100 @@ _BUSINESS_PEER_INVALID_HINT = (
     "включено «только новые чаты», а это старый диалог, либо чат в исключениях)."
 )
 
+def _mute_notify_text(unmuted: bool = False) -> str:
+    if unmuted:
+        return f"🔊 <b>Мьют снят.</b>\nБот: {_bot_tag()}"
+    return (
+        "🔇 <b>Этот чат замьючен.</b>\n"
+        "Входящие сообщения удаляются автоматически.\n"
+        f"Бот: {_bot_tag()}"
+    )
+
+
+def _mute_notify_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔊 Размьютить", callback_data=MUTE_NOTIFY_CALLBACK)]
+    ])
+
+
+async def send_mute_notify(bot, storage, bc_id, chat_id) -> None:
+    """Шлёт в сам чат (не в личку владельцу) сообщение "чат замьючен" с кнопкой
+    «Размьютить» и закрепляет его. Используется .mute, когда фишка включена в
+    настройках. Если сообщение для этого чата уже отправлено и закреплено —
+    повторно не шлёт (чтобы не спамить при .mute поверх уже активного мьюта)."""
+    if bot is None:
+        return
+    existing = await storage.get_mute_notify_message_id(bc_id, chat_id)
+    if existing:
+        return
+    try:
+        sent = await bot.send_message(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            text=_mute_notify_text(),
+            reply_markup=_mute_notify_kb(),
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось отправить сообщение о муте в чат %s (bc=%s)", chat_id, bc_id)
+        return
+
+    await storage.set_mute_notify_message_id(bc_id, chat_id, sent.message_id)
+
+    try:
+        await bot.pin_chat_message(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except TelegramAPIError:
+        log.exception(
+            "Не удалось закрепить сообщение о муте в чате %s (bc=%s) — "
+            "проверь право «Закрепление сообщений» в Business-подключении.",
+            chat_id, bc_id,
+        )
+
+
+async def clear_mute_notify(bot, storage, bc_id, chat_id, message_id: int | None = None) -> None:
+    """Открепляет и редактирует сообщение "чат замьючен" при .unmute (или нажатии
+    кнопки «Размьютить»)."""
+    if bot is None:
+        return
+    if message_id is None:
+        message_id = await storage.get_mute_notify_message_id(bc_id, chat_id)
+    if not message_id:
+        return
+
+    try:
+        await bot.unpin_chat_message(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    except TelegramAPIError:
+        log.exception("Не удалось открепить сообщение о муте в чате %s (bc=%s)", chat_id, bc_id)
+
+    try:
+        await bot.edit_message_text(
+            business_connection_id=bc_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=_mute_notify_text(unmuted=True),
+        )
+    except TelegramAPIError:
+        pass  # сообщение могли удалить вручную — не критично
+
+    await storage.set_mute_notify_message_id(bc_id, chat_id, None)
+
+
 HELP_TEXT = """<b>LimeEye — команды</b>
 Пишутся прямо в чате с собеседником (не боту), с префиксом «.».
 
 <code>.mute [время]</code> — глушить входящие сообщения в этом чате (удалять их сразу).
    Без аргумента — навсегда. Пример: <code>.mute 1h30m</code>, <code>.mute 2d</code>, <code>.mute</code>
-<code>.unmute</code> — снять мьют с этого чата.
+   Если в «🎛 Фишки» включено «🔇 Сообщение о муте» — при мьюте бот дополнительно
+   шлёт в этот же чат закреплённое сообщение с кнопкой «Размьютить».
+<code>.unmute</code> — снять мьют с этого чата (сообщение о муте, если было, открепится).
 <code>.nomute текст</code> — отправить сообщение от лица бота (оригинальная команда удаляется).
 <code>.anim текст</code> — отправить сообщение с эффектом "печатает" (typing + постепенное появление слов).
 <code>.spam N текст</code> — отправить "текст" N раз подряд (максимум 50 за раз).
@@ -49,6 +153,8 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 <code>.export</code> — выгрузить всю кэшированную переписку этого чата в .txt-файл себе в личку.
 <code>.currency СУММА ИЗ В</code> — конвертер валют (курс на сегодня), ответ приходит прямо в этот чат.
    Пример: <code>.currency 100 USD RUB</code>
+<code>.info</code> — информация об аккаунте собеседника (id, юзернейм, имя, примерная дата регистрации),
+   ответ приходит тебе в личные сообщения с ботом.
 <code>.rps</code> — камень-ножницы-бумага с собеседником прямо в чате (кнопки под сообщением).
 <code>.rps stop</code> — досрочно завершить текущий раунд в этом чате.
 <code>.hangman</code> — виселица: собеседник отгадывает слово, которое ты загадал через
@@ -66,6 +172,9 @@ HELP_TEXT = """<b>LimeEye — команды</b>
 Учти: для <code>.mute</code> и очистки самой команды из чата нужно, чтобы при
 подключении бота в Settings → Автоматизация чатов было включено
 право «Delete messages» (можно удалять чужие сообщения).
+Для фишки «🔇 Сообщение о муте» (закреп сообщения при мьюте) дополнительно нужно
+право «Закрепление сообщений» (Pin messages) — без него сообщение отправится, но
+не закрепится.
 """
 
 
@@ -94,11 +203,18 @@ async def cmd_mute(chat_id, args, storage, bc_id, message=None, bot=None) -> str
     await storage.mute_chat(bc_id, chat_id, seconds, chat_name=chat_name, chat_username=chat_username)
     label = human_duration(seconds) if seconds else "навсегда"
     who = f" (@{chat_username})" if chat_username else (f" ({chat_name})" if chat_name else "")
+
+    if await storage.get_mute_notify_enabled(bc_id):
+        await send_mute_notify(bot, storage, bc_id, chat_id)
+
     return f"🔇 Чат{who} замьючен ({label}). Входящие сообщения будут удаляться."
 
 
 async def cmd_unmute(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    notify_message_id = await storage.get_mute_notify_message_id(bc_id, chat_id)
     await storage.unmute_chat(bc_id, chat_id)
+    if notify_message_id:
+        await clear_mute_notify(bot, storage, bc_id, chat_id, message_id=notify_message_id)
 
     who = ""
     if message is not None:
@@ -752,6 +868,105 @@ async def cmd_tic(chat_id, args, storage, bc_id, message=None, bot=None) -> str 
     return None
 
 
+# Приблизительная оценка даты регистрации аккаунта по его user_id.
+# Telegram официально не отдаёт дату регистрации через Bot API — это лишь
+# грубая интерполяция по общедоступным данным о примерном соответствии
+# диапазонов id и периодов регистрации. Может ощутимо ошибаться.
+_ID_DATE_TABLE = [
+    (100_000_000, datetime(2013, 8, 1, tzinfo=timezone.utc)),
+    (200_000_000, datetime(2014, 8, 1, tzinfo=timezone.utc)),
+    (300_000_000, datetime(2015, 5, 1, tzinfo=timezone.utc)),
+    (400_000_000, datetime(2016, 3, 1, tzinfo=timezone.utc)),
+    (500_000_000, datetime(2016, 8, 1, tzinfo=timezone.utc)),
+    (600_000_000, datetime(2017, 2, 1, tzinfo=timezone.utc)),
+    (700_000_000, datetime(2017, 8, 1, tzinfo=timezone.utc)),
+    (800_000_000, datetime(2018, 3, 1, tzinfo=timezone.utc)),
+    (900_000_000, datetime(2018, 8, 1, tzinfo=timezone.utc)),
+    (1_000_000_000, datetime(2019, 2, 1, tzinfo=timezone.utc)),
+    (1_100_000_000, datetime(2019, 7, 1, tzinfo=timezone.utc)),
+    (1_200_000_000, datetime(2019, 10, 1, tzinfo=timezone.utc)),
+    (1_300_000_000, datetime(2020, 2, 1, tzinfo=timezone.utc)),
+    (1_400_000_000, datetime(2020, 5, 1, tzinfo=timezone.utc)),
+    (1_500_000_000, datetime(2020, 8, 1, tzinfo=timezone.utc)),
+    (1_600_000_000, datetime(2020, 10, 1, tzinfo=timezone.utc)),
+    (1_700_000_000, datetime(2021, 1, 1, tzinfo=timezone.utc)),
+    (1_800_000_000, datetime(2021, 3, 1, tzinfo=timezone.utc)),
+    (1_900_000_000, datetime(2021, 5, 1, tzinfo=timezone.utc)),
+    (2_000_000_000, datetime(2021, 8, 1, tzinfo=timezone.utc)),
+    (3_000_000_000, datetime(2022, 3, 1, tzinfo=timezone.utc)),
+    (4_000_000_000, datetime(2022, 8, 1, tzinfo=timezone.utc)),
+    (5_000_000_000, datetime(2023, 1, 1, tzinfo=timezone.utc)),
+    (6_000_000_000, datetime(2023, 8, 1, tzinfo=timezone.utc)),
+    (7_000_000_000, datetime(2024, 3, 1, tzinfo=timezone.utc)),
+    (8_000_000_000, datetime(2024, 10, 1, tzinfo=timezone.utc)),
+]
+
+
+def _interp_date(lo_id, lo_date, hi_id, hi_date, user_id) -> datetime:
+    frac = (user_id - lo_id) / (hi_id - lo_id)
+    delta = hi_date - lo_date
+    return lo_date + delta * frac
+
+
+def estimate_registration_date(user_id: int) -> datetime | None:
+    if not user_id or user_id <= 0:
+        return None
+
+    first_id, first_date = _ID_DATE_TABLE[0]
+    if user_id <= first_id:
+        return first_date
+
+    last_id, last_date = _ID_DATE_TABLE[-1]
+    if user_id >= last_id:
+        return last_date
+
+    for (lo_id, lo_date), (hi_id, hi_date) in zip(_ID_DATE_TABLE, _ID_DATE_TABLE[1:]):
+        if lo_id <= user_id <= hi_id:
+            return _interp_date(lo_id, lo_date, hi_id, hi_date, user_id)
+    return None
+
+
+async def cmd_info(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
+    user_id = chat_id
+    username = None
+    name = None
+
+    if message is not None:
+        chat = message.chat
+        username = getattr(chat, "username", None)
+        first = getattr(chat, "first_name", None)
+        last = getattr(chat, "last_name", None)
+        if first or last:
+            name = " ".join(p for p in (first, last) if p)
+
+    # Пробуем получить более свежие данные через getChat, но не роняем
+    # команду, если это не удалось (например, нет прав/чат недоступен).
+    if bot is not None:
+        try:
+            fresh = await bot.get_chat(chat_id, business_connection_id=bc_id)
+            username = getattr(fresh, "username", None) or username
+            fresh_first = getattr(fresh, "first_name", None)
+            fresh_last = getattr(fresh, "last_name", None)
+            if fresh_first or fresh_last:
+                name = " ".join(p for p in (fresh_first, fresh_last) if p)
+        except Exception:
+            log.exception(".info: не удалось получить getChat (chat_id=%s, bc=%s)", chat_id, bc_id)
+
+    reg_date = estimate_registration_date(user_id)
+    reg_str = reg_date.strftime("%B %Y") if reg_date else "не удалось оценить"
+
+    lines = [
+        "📇 <b>Информация об аккаунте</b>",
+        f"🆔 ID: <code>{user_id}</code>",
+        f"👤 Имя: {html_escape(name) if name else 'не задано'}",
+        f"🔗 Юзернейм: @{html_escape(username)}" if username else "🔗 Юзернейм: не задан",
+        f"📅 Дата регистрации (оценочно): {html_escape(reg_str)}",
+        "",
+        "<i>Дата регистрации — приблизительная оценка по id, Telegram её официально не раскрывает.</i>",
+    ]
+    return "\n".join(lines)
+
+
 async def cmd_help(chat_id, args, storage, bc_id, message=None, bot=None) -> str:
     return HELP_TEXT
 
@@ -766,6 +981,7 @@ COMMANDS = {
     "short": cmd_short,
     "export": cmd_export,
     "currency": cmd_currency,
+    "info": cmd_info,
     "rps": cmd_rps,
     "hangman": cmd_hangman,
     "tic": cmd_tic,
@@ -801,6 +1017,22 @@ HELP_ITEMS = [
                     "время. Поддерживаются единицы: <code>d</code> (дни), <code>h</code> (часы), "
                     "<code>m</code> (минуты), <code>s</code> (секунды) — их можно сочетать. "
                     "По истечении срока мьют снимется автоматически."
+                ),
+            },
+            {
+                "key": "notify",
+                "button": "🔇 Сообщение о муте",
+                "title": "🔇 Сообщение о муте",
+                "desc": (
+                    "Отдельная фишка, включается/выключается в «🎛 Фишки» → «🔇 Сообщение "
+                    "о муте» (в личном чате с ботом).\n\n"
+                    "Пока включена: каждый раз при <code>.mute</code> бот отправляет прямо в "
+                    "сам чат сообщение о том, что чат замьючен (с упоминанием бота) и кнопкой "
+                    "«🔊 Размьютить», и закрепляет его. Кнопку может нажать только владелец "
+                    "аккаунта — при нажатии (или при <code>.unmute</code>) сообщение открепляется "
+                    "и обновляется на «мьют снят».\n\n"
+                    "Требует право «Закрепление сообщений» в Business-подключении — без него "
+                    "сообщение отправится, но не закрепится."
                 ),
             },
         ],
@@ -950,6 +1182,18 @@ HELP_ITEMS = [
                 "desc": "<code>.currency 100 USD RUB</code>\n<code>.currency 50 EUR USD</code>",
             },
         ],
+    },
+    {
+        "key": "info",
+        "button": "📇 .info",
+        "title": "📇 .info",
+        "desc": (
+            "Показывает информацию об аккаунте собеседника в этом чате: id, юзернейм, имя и "
+            "примерную дату регистрации. Ответ приходит не в чат, а тебе в личные сообщения с ботом.\n\n"
+            "⚠️ Дата регистрации — грубая оценка по диапазону id (Telegram официально её не раскрывает), "
+            "может ощутимо отличаться от реальной."
+        ),
+        "subs": [],
     },
     {
         "key": "rps",
